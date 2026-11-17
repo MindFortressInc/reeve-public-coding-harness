@@ -222,6 +222,29 @@ check "pushd -n away from a worktree"       "pushd -n $WT; git stash clear"   "$
 check "pushd changes the cwd"               "pushd $WT; git stash clear"      "$SOLO" DENY "linked worktree"
 check "bare pushd target is untracked"      "pushd; git stash clear"          "$SOLO" DENY "unknown"
 
+check "env -S \\_ separates words"          "env -S 'git\\_stash\\_clear'"   "$WT" DENY "linked worktree"
+check "env -S \\_ in double quotes is a space" "env -S '\"git\\_stash\" clear'" "$WT" ALLOW
+check "env -S \\c ends the string"          "env -S 'git stash list\\c clear'" "$WT" ALLOW
+check "function body judged where it is called" "f() { git stash clear; }; cd $MAIN; f" "$SOLO" DENY "other worktree"
+check "function called in a solo repo"      "f() { git stash clear; }; f"     "$SOLO" ALLOW
+check "function keyword form, called later" "function f { git stash pop; }; cd $WT; f" "$SOLO" DENY "linked worktree"
+check "called function's cd carries on"     "f() { cd $SOLO; }; f; git stash pop" "$WT" ALLOW
+check "unset -f drops a function"           "f() { cd $WT; }; unset -f f; f; git stash pop" "$SOLO" ALLOW
+check "CDPATH steers a relative cd"         "CDPATH=$T; cd main.wt; git stash clear" "$PLAIN" DENY "linked worktree"
+mkdir -p "$PLAIN/main.wt"
+check "CDPATH wins over a local match"      "CDPATH=$T; cd main.wt; git stash clear" "$PLAIN" DENY "linked worktree"
+check "./ skips CDPATH"                     "CDPATH=$T; cd ./main.wt; git stash clear" "$PLAIN" ALLOW
+check "uncertain CDPATH fails closed"       "true && CDPATH=$T; cd main.wt; git stash clear" "$PLAIN" DENY "could not resolve"
+check "bash -c -- body"                     "bash -c -- 'git stash clear'"    "$WT" DENY "linked worktree"
+check "bash -c with options after it"       "bash -c -e -o pipefail 'git stash pop'" "$WT" DENY "linked worktree"
+mkdir -p "$T/althome"; git config -f "$T/althome/.gitconfig" alias.wipe 'stash clear'
+check "scoped HOME reaches the alias probe" "HOME=$T/althome git wipe"        "$WT" DENY "linked worktree"
+check "scoped XDG_CONFIG_HOME alias probe"  "HOME=$T/nohome XDG_CONFIG_HOME=$T/xdg git wipe2" "$WT" ALLOW
+check "alias with an unresolved -C target"  "git -C \"\$(printf $MAIN)\" wipe" "$SOLO" DENY "could not resolve"
+check "real command with unresolved -C"     "git -C \"\$(printf $MAIN)\" submodule status" "$SOLO" ALLOW
+check "alias after an uncertain cd"         "cd $MAIN || true; git wipe"      "$SOLO" DENY "could not resolve"
+check "alias chain past the depth bound"    "git -c alias.a=b -c alias.b=c -c alias.c=d -c alias.d=e -c 'alias.e=stash clear' a" "$WT" DENY "nested too deeply"
+check "deep alias chain ending in a builtin" "git -c alias.a=b -c alias.b=c -c alias.c=d -c alias.d=status a" "$WT" ALLOW
 mkdir -p "$T/bin"; REAL_GIT=$(command -v git)
 printf '#!/bin/sh\nfor a; do [ "$a" = worktree ] && exit 1; done\nexec %s "$@"\n' "$REAL_GIT" > "$T/bin/git"; chmod +x "$T/bin/git"
 PATH="$T/bin:$PATH" \
@@ -230,6 +253,10 @@ check "failed worktree probe fails closed"  "git stash"                       "$
 printf '#!/bin/sh\nfor a; do [ "$a" = rev-parse ] && exit 1; done\nexec %s "$@"\n' "$REAL_GIT" > "$T/bin/git"
 PATH="$T/bin:$PATH" \
 check "failed repo probe fails closed"      "git stash"                       "$SOLO" DENY "could not probe"
+
+printf '#!/bin/sh\nsleep 0.6\nexec %s "$@"\n' "$REAL_GIT" > "$T/bin/git"
+PATH="$T/bin:$PATH" STASH_GUARD_BUDGET=1 \
+check "probes share one deadline"           "git -c alias.a=b -c 'alias.b=stash pop' a" "$SOLO" DENY "timed out"
 
 # --- the main checkout is guarded too while other worktrees exist
 check "main tree with a linked wt attached" "git stash"                       "$MAIN" DENY "other worktree"

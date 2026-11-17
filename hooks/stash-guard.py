@@ -57,6 +57,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 
 READ_ONLY = {"list", "show"}
 SHELLS = {"bash", "sh", "zsh", "dash"}
@@ -111,6 +112,12 @@ UNCERTAIN = "\0?"                         # env value: a step that may not have 
 LOCAL = "\0l"                             # env key prefix: that var is set but not exported
 MAX_DEPTH = 3                             # nested shell/eval bodies scanned
 GIT_TARGET = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
+CONFIG_HOME = ("HOME", "XDG_CONFIG_HOME")  # select git's global config file
+FUNC = "\0f"                              # env key prefix: a shell function's bodies
+# Every git probe shares one budget, kept under the hook's registered 10s
+# timeout: a timed-out hook blocks nothing, so the deny must come first.
+BUDGET = float(os.environ.get("STASH_GUARD_BUDGET") or 7)
+DEADLINE = time.monotonic() + BUDGET
 
 ALTERNATIVES = (
     "refs/stash is ONE stack shared by every worktree of this repo, so a pop "
@@ -415,11 +422,33 @@ def resolve(path, cwd, env, physical=False):
     return os.path.realpath(path) if physical else os.path.normpath(path)
 
 
+def cd_target(arg, cwd, env, physical):
+    """Where `cd <arg>` lands: a relative word not starting with `.` / `..`
+    is looked up along $CDPATH first (an empty entry is the cwd), as bash
+    does, then taken relative to the cwd."""
+    path = expand(arg, env)
+    cdpath = env.get("CDPATH", "")
+    if os.path.isabs(path) or not cdpath or \
+            path.split("/", 1)[0] in (".", ".."):
+        return resolve(arg, cwd, env, physical)
+    if cdpath == UNCERTAIN:
+        raise Unresolved("$CDPATH is set by a step that may not have run")
+    for entry in cdpath.split(":"):
+        cand = resolve(os.path.join(entry or ".", path), cwd, env, physical)
+        if os.path.isdir(cand):
+            return cand
+    return resolve(arg, cwd, env, physical)
+
+
 def git(args, git_env):
-    """The finished `git <args>`, or None when git could not run or timed out."""
+    """The finished `git <args>`, or None when git could not run or timed out
+    (each probe gets at most 5s, and never more than the hook budget left)."""
+    left = min(5, DEADLINE - time.monotonic())
+    if left <= 0:
+        return None
     try:
         return subprocess.run(["git", *args], capture_output=True, text=True,
-                              timeout=5, env={**git_env, "LC_ALL": "C",
+                              timeout=left, env={**git_env, "LC_ALL": "C",
                                               "LANGUAGE": "C"})
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -453,12 +482,64 @@ def shared_reason(target, git_dir, work_tree, git_env):
     return None
 
 
+ENV_S_ESCAPES = {"f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v",
+                 "#": "#", "$": "$", '"': '"', "'": "'", "\\": "\\"}
+
+
 def split_string(val):
-    """The words `env -S` / `--split-string` splits its operand into."""
-    try:
-        return shlex.split(val)
-    except ValueError:
+    """The words `env -S` / `--split-string` splits its operand into, by GNU
+    env's rules: `\\_` separates words outside double quotes (a space inside
+    them), `\\c` ends the string, `#` at a word start begins a comment, and
+    `${VAR}` stays in the word for the caller to expand. A string env would
+    reject (an unknown escape, an unclosed quote) runs nothing; it is split
+    on whitespace so a stash in it is still judged."""
+    out, cur, i, n, q = [], None, 0, len(val), None
+    while i < n:
+        c = val[i]
+        if q == "'":
+            if c == "'":
+                q = None
+            elif c == "\\" and val[i + 1:i + 2] in ("\\", "'"):
+                cur += val[i + 1]
+                i += 1
+            else:
+                cur += c
+        elif c == "\\":
+            e = val[i + 1:i + 2]
+            if e == "c":
+                break
+            if e == "_":
+                if q:
+                    cur += " "
+                elif cur is not None:
+                    out.append(cur)
+                    cur = None
+            elif e in ENV_S_ESCAPES:
+                cur = (cur or "") + ENV_S_ESCAPES[e]
+            else:
+                return val.split()
+            i += 1
+        elif q == '"':
+            if c == '"':
+                q = None
+            else:
+                cur += c
+        elif c in " \t\n\r\f\v":
+            if cur is not None:
+                out.append(cur)
+                cur = None
+        elif c == "#" and cur is None:
+            break
+        elif c in ("'", '"'):
+            q, cur = c, cur or ""
+        else:
+            cur = (cur or "") + c
+        i += 1
+    if q:
         return val.split()
+    if cur is not None:
+        out.append(cur)
+    return out
 
 
 def strip_prefix(toks, env):
@@ -566,7 +647,8 @@ def exported_env(env, scoped):
     with_scoped() gives, minus the vars that were set but never exported.
     A command-scoped VAR=val always reaches the child; a var whose export may
     not have run is UNCERTAIN."""
-    out = with_scoped(env, scoped)
+    out = {k: v for k, v in with_scoped(env, scoped).items()
+           if not k.startswith(FUNC)}
     for k in [k for k in out if k.startswith(LOCAL)]:
         name, flag = k[len(LOCAL):], out.pop(k)
         if name in scoped or name not in out:
@@ -601,9 +683,39 @@ def merge(cwd, env, cwd2, env2):
     two disagree on is unknown (None), an env var they disagree on UNCERTAIN."""
     out = dict(env)
     for k in set(env) | set(env2):
-        if env.get(k) != env2.get(k):
+        if k.startswith(FUNC):            # either body may be the one defined
+            a = env.get(k, ())
+            out[k] = a + tuple(b for b in env2.get(k, ()) if b not in a)
+        elif env.get(k) != env2.get(k):
             out[k] = UNCERTAIN
     return (cwd if cwd == cwd2 else None), out
+
+
+def shell_c_body(args):
+    """The command string of `sh [options] -c string ...`, or None without
+    -c. Every option is parsed first (`-o` / `-O` / `+o` / `+O` take a
+    value, `--rcfile` / `--init-file` too, `--` / `-` end them), so the string
+    is the first word after the options wherever -c sits among them."""
+    has_c, i = False, 0
+    while i < len(args):
+        t = args[i]
+        if t in ("--", "-"):
+            i += 1
+            break
+        if t in ("--rcfile", "--init-file"):
+            i += 2
+            continue
+        if t.startswith("--"):
+            i += 1
+            continue
+        if len(t) < 2 or t[0] not in "-+":
+            break
+        i += 1
+        if t[0] == "-" and SHELL_C.fullmatch(t):
+            has_c = True
+        if t[-1] in "oO":                 # -o pipefail / -euo pipefail
+            i += 1
+    return args[i] if has_c and i < len(args) else None
 
 
 def may_stash(text):
@@ -630,11 +742,14 @@ def scan(cmd, cwd, env, depth):
     elem = lst                            # ... and this pipeline element
     cond = piped = False
     func, fdepth, skip = None, 0, 0       # state at a `f() {` definition, its { } depth
-    segs = segments(cmd) + [SEP]
+    fname, fbody = None, []               # the function being defined, its segments
+    segs = (list(cmd) if isinstance(cmd, list) else segments(cmd)) + [SEP]
     for idx, seg in enumerate(segs):
         if skip:
             skip -= 1
             continue
+        if func is not None:
+            fbody.append(seg)
         nxt = segs[idx + 1:idx + 4]
         if type(seg) is Seg and FUNC_DEF.fullmatch(seg) and len(nxt) == 3 and \
                 nxt[0] == OPEN and type(nxt[1]) is Seg and not nxt[1].strip() \
@@ -644,7 +759,7 @@ def scan(cmd, cwd, env, depth):
                          if s != SEP and (type(s) is not Seg or s.strip())), None)
             if func is None and type(body) is Seg and body.split()[:1] == ["{"]:
                 func = (cwd, dict(env), lst, elem, cond, piped, blocks)
-                blocks = []
+                blocks, fname, fbody = [], seg.split()[-1], []
             continue
         if seg == OPEN:
             scopes.append((cwd, dict(env), lst, elem, cond, piped, blocks))
@@ -684,14 +799,17 @@ def scan(cmd, cwd, env, depth):
             toks, herestrs = seg.split(), []
         if func is None and toks[:1] == ["function"] and toks[2:3] == ["{"]:
             func = (cwd, dict(env), lst, elem, cond, piped, blocks)
-            blocks, toks = [], toks[2:]   # `function f {`: the body follows
+            fname, blocks, toks = toks[1], [], toks[2:]  # `function f {`: the body follows
+            fbody = [Seg(re.sub(r"^\s*function\s+\S+", "", seg))]
+            fbody[0].docs = seg.docs
         while toks and toks[0] in BLOCK_WORDS:
             w, toks = toks[0], toks[1:]
             if func is not None and w in ("{", "}"):
                 fdepth += 1 if w == "{" else -1
-                if fdepth == 0:           # the body ends: it runs only if f is called
-                    saved_cwd, saved_env, lst, elem, cond, piped, blocks = func
-                    cwd, env = merge(cwd, env, saved_cwd, saved_env)
+                if fdepth == 0:           # the body ends: it runs only where f is called
+                    cwd, env, lst, elem, cond, piped, blocks = func
+                    env[FUNC + fname] = ((tuple(fbody), " ".join(
+                        [*fbody, *(d for b in fbody for d, _ in getattr(b, "docs", ()))])),)
                     func = None
                 continue
             if w in OPENERS:              # a branch or loop body may be skipped
@@ -722,6 +840,14 @@ def scan(cmd, cwd, env, depth):
                     env[k] = UNCERTAIN
             continue
         head = toks[0]
+        if FUNC + head in env:            # a call: the body runs here, in this state
+            bodies = env[FUNC + head]
+            reason, cwd, env = run_here([list(b) for b, _ in bodies],
+                                        [t for _, t in bodies], cwd, env,
+                                        scoped, depth)
+            if reason:
+                return reason, cwd, env
+            continue
         if head in ("export", "unset"):
             opts = "".join(t[1:] for t in toks[1:] if t.startswith("-"))
             for t in toks[1:]:
@@ -729,7 +855,9 @@ def scan(cmd, cwd, env, depth):
                 if t.startswith("-") or not ASSIGN.match(k + "="):
                     continue
                 if head == "unset":
-                    if "f" not in opts:
+                    if "f" in opts:
+                        env.pop(FUNC + k, None)
+                    else:
                         env.pop(k, None)
                         env.pop(LOCAL + k, None)
                     continue
@@ -755,7 +883,7 @@ def scan(cmd, cwd, env, depth):
                 if head == "popd" or args[:1] == ["-"] or \
                         (head == "pushd" and not args):  # swap / rotate (-N)
                     raise Unresolved("cd -/popd target is not tracked")
-                cwd = (resolve(args[0], cwd, env, physical) if args
+                cwd = (cd_target(args[0], cwd, env, physical) if args
                        else env.get("HOME"))
             except Unresolved:
                 cwd = None
@@ -785,9 +913,7 @@ def scan(cmd, cwd, env, depth):
             if name == "eval":
                 raw = " ".join(toks[1:])
             else:                         # -c, or a cluster like -lc / -ec
-                k = next((k for k, t in enumerate(toks[1:], 1)
-                          if SHELL_C.fullmatch(t)), None)
-                raw = toks[k + 1] if k is not None and k + 1 < len(toks) else None
+                raw = shell_c_body(toks[1:])
             if raw:
                 scripts = variants(raw, env)  # `eval "$CMD"` runs what $CMD holds
             elif name == "eval":
@@ -798,43 +924,28 @@ def scan(cmd, cwd, env, depth):
                 scripts += [s for h in herestrs for s in variants(h, env)]
             if not scripts:
                 continue
-            if depth >= MAX_DEPTH:
-                if any(may_stash(s) for s in scripts):
-                    return ("[stash-guard] Blocked a shell body that may run "
-                            "`git stash`: it is nested too deeply to inspect, "
-                            "and an uninspected mutating stash is denied by "
-                            "default. " + ALTERNATIVES), cwd, env
-                continue
-            try:                          # eval shares this shell; a child gets the exports
-                body_env = (with_scoped if name == "eval" else exported_env)(env, scoped)
-            except Unresolved as e:
-                if not any(may_stash(s) for s in scripts):
-                    continue
-                return ("[stash-guard] Blocked a shell body that may run "
-                        f"`git stash`: could not resolve which repo it targets "
-                        f"({e}), and an unresolvable mutating stash is denied "
-                        "by default. " + ALTERNATIVES), cwd, env
-            if name != "eval":            # a child shell: its state is its own
-                for s in scripts:
-                    reason = judge(s, run_cwd, dict(body_env), depth + 1)
-                    if reason:
-                        return reason, cwd, env
-                continue
-            outs = []
-            for s in scripts:
-                reason, c, e = scan(s, cwd, dict(body_env), depth + 1)
+            if name == "eval":            # eval shares this shell: its cd/exports stay
+                reason, cwd, env = run_here(scripts, scripts, cwd, env, scoped,
+                                            depth)
                 if reason:
                     return reason, cwd, env
-                outs.append((c, e))
-            cwd, after = outs[0]
-            for c, e in outs[1:]:         # readings that disagree leave it uncertain
-                cwd, after = merge(cwd, after, c, e)
-            for k in scoped:              # `A=b eval ...` sets A only for the eval
-                if k in env:
-                    after[k] = env[k]
-                else:
-                    after.pop(k, None)
-            env = after                   # eval runs here: its cd/exports stay
+                continue
+            if depth >= MAX_DEPTH:
+                reason = nested_bar(scripts, depth)
+                if reason:
+                    return reason, cwd, env
+                continue
+            try:                          # a child shell gets the exports
+                body_env = exported_env(env, scoped)
+            except Unresolved as e:
+                reason = body_unresolved(scripts, e)
+                if reason:
+                    return reason, cwd, env
+                continue
+            for s in scripts:             # a child shell: its state is its own
+                reason = judge(s, run_cwd, dict(body_env), depth + 1)
+                if reason:
+                    return reason, cwd, env
             continue
         if name != "git":
             continue
@@ -844,6 +955,53 @@ def scan(cmd, cwd, env, depth):
     if scopes:                            # an unclosed ( ends with the command
         cwd, env = scopes[0][:2]
     return None, cwd, env
+
+
+def nested_bar(texts, depth):
+    """The deny reason when bodies past the scan depth may run a stash."""
+    if depth >= MAX_DEPTH and any(may_stash(t) for t in texts):
+        return ("[stash-guard] Blocked a shell body that may run `git stash`: "
+                "it is nested too deeply to inspect, and an uninspected "
+                "mutating stash is denied by default. " + ALTERNATIVES)
+    return None
+
+
+def body_unresolved(texts, e):
+    """The deny reason when a body that may stash gets an unresolvable env."""
+    if not any(may_stash(t) for t in texts):
+        return None
+    return ("[stash-guard] Blocked a shell body that may run `git stash`: "
+            f"could not resolve which repo it targets ({e}), and an "
+            "unresolvable mutating stash is denied by default. " + ALTERNATIVES)
+
+
+def run_here(scripts, texts, cwd, env, scoped, depth):
+    """(deny reason or None, cwd, env) after bodies run in this shell (an
+    `eval`, a function call): each alternative is scanned in the caller's
+    state, readings that disagree leave it uncertain, its cd / exports stay,
+    and a command-scoped `A=b` lasts only for the call. `texts` are the
+    bodies as text, for the depth bar."""
+    if depth >= MAX_DEPTH:
+        return nested_bar(texts, depth), cwd, env
+    try:
+        body_env = with_scoped(env, scoped)
+    except Unresolved as e:
+        return body_unresolved(texts, e), cwd, env
+    outs = []
+    for s in scripts:
+        reason, c, e = scan(s, cwd, dict(body_env), depth + 1)
+        if reason:
+            return reason, cwd, env
+        outs.append((c, e))
+    cwd, after = outs[0]
+    for c, e in outs[1:]:
+        cwd, after = merge(cwd, after, c, e)
+    for k in scoped:
+        if k in env:
+            after[k] = env[k]
+        else:
+            after.pop(k, None)
+    return None, cwd, after
 
 
 def blocked(label, why):
@@ -908,6 +1066,11 @@ def judge_git(args, cwd, env, scoped=None, depth=0):
     if not isinstance(seen, Unresolved):
         git_env.update({k: v for k, v in seen.items()
                         if k.startswith("GIT_CONFIG") and v != UNCERTAIN})
+        for k in CONFIG_HOME:             # where git finds its global config
+            if k not in seen:
+                git_env.pop(k, None)
+            elif seen[k] != UNCERTAIN:
+                git_env[k] = seen[k]
     resolved = []                         # --config-env=key=VAR takes VAR's exported value
     for c in configs:
         if isinstance(c, str):
@@ -921,9 +1084,15 @@ def judge_git(args, cwd, env, scoped=None, depth=0):
         elif val is not None:             # an unset VAR makes git fail outright
             resolved.append(f"{key}={val}")
     configs = resolved
-    if rest[0] != "stash":
+    if rest[0] != "stash":                # whose repo config may define the alias
+        where = pending_unresolved or (target is None and "the working "
+                                       "directory is unknown") or \
+            (seen if isinstance(seen, Unresolved) else None) or \
+            next((f"${k} is set by a step that may not have run"
+                  for k in GIT_TARGET if seen.get(k) == UNCERTAIN), None)
         return judge_alias(rest, target, git_dir, work_tree, configs,
-                           config_unresolved, seen, git_env, depth)
+                           config_unresolved, seen, git_env, depth,
+                           str(where) if where else None)
     sub = rest[1] if len(rest) > 1 else "push"
     try:
         sub = (expand_word(sub, env) or ["push"])[0]
@@ -954,12 +1123,33 @@ def judge_git(args, cwd, env, scoped=None, depth=0):
     return f"[stash-guard] Blocked {label}: {reason}. " + ALTERNATIVES
 
 
+def is_git_command(name, git_env):
+    """Whether `git <name>` runs a dashed command (`git-<name>` in git's
+    exec path or on $PATH), which git tries before any alias."""
+    if "/" in name:
+        return False
+    r = git(["--exec-path"], git_env)
+    dirs = ([r.stdout.strip()] if r is not None and not r.returncode else []) + \
+        git_env.get("PATH", "").split(os.pathsep)
+    return any(d and os.access(os.path.join(d, "git-" + name), os.X_OK)
+               for d in dirs)
+
+
+def final_word(words_):
+    """The subcommand an alias's words run, past git's own options."""
+    i = 0
+    while i < len(words_) and words_[i].startswith("-"):
+        i += 2 if words_[i] in GIT_OPTS_WITH_VALUE else 1
+    return words_[i] if i < len(words_) else None
+
+
 def judge_alias(rest, target, git_dir, work_tree, configs, config_unresolved,
-                seen, git_env, depth):
+                seen, git_env, depth, unresolved=None):
     """Deny reason when `git <rest>` runs an alias (`-c alias.x=...` on the
     command line, or configured) that can reach a mutating stash, else None.
     git ignores an alias that shadows a builtin, so those are not looked up.
-    A `!` alias is a shell body run at the repo's top level."""
+    A `!` alias is a shell body run at the repo's top level. `unresolved`
+    says why the repo whose config may define it is unknown."""
     name = rest[0]
     if name in GIT_BUILTINS or name.startswith("-"):
         return None
@@ -967,6 +1157,11 @@ def judge_alias(rest, target, git_dir, work_tree, configs, config_unresolved,
     if config_unresolved:
         return blocked(label, f"a `-c` value that may define its alias "
                               f"cannot be expanded: {config_unresolved}")
+    if unresolved:
+        if is_git_command(name, git_env):
+            return None                   # a real command: no alias can shadow it
+        return blocked(label, f"it may be an alias defined in that repo's "
+                              f"config: {unresolved}")
     base = (["-C", target] if target else []) + \
         ([f"--git-dir={git_dir}"] if git_dir else []) + \
         ([f"--work-tree={work_tree}"] if work_tree else [])
@@ -981,8 +1176,16 @@ def judge_alias(rest, target, git_dir, work_tree, configs, config_unresolved,
     value = r.stdout.strip() if r.returncode == 0 else ""
     if not value:
         return None
-    if depth >= MAX_DEPTH:
-        if may_stash(value):
+    if depth >= MAX_DEPTH:                # past here only a builtin ends the chain
+        if value.startswith("!"):
+            ends = not may_stash(value) and "git" not in value
+        else:
+            try:
+                w = final_word(shlex.split(value))
+            except ValueError:
+                w = None
+            ends = w in GIT_BUILTINS and not may_stash(value)
+        if not ends:
             return ("[stash-guard] Blocked " + label + ": its alias chain is "
                     "nested too deeply to inspect, and an uninspected mutating "
                     "stash is denied by default. " + ALTERNATIVES)
