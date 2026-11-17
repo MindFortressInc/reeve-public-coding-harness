@@ -230,6 +230,15 @@ check "function called in a solo repo"      "f() { git stash clear; }; f"     "$
 check "function keyword form, called later" "function f { git stash pop; }; cd $WT; f" "$SOLO" DENY "linked worktree"
 check "called function's cd carries on"     "f() { cd $SOLO; }; f; git stash pop" "$WT" ALLOW
 check "unset -f drops a function"           "f() { cd $WT; }; unset -f f; f; git stash pop" "$SOLO" ALLOW
+check "skipped definition runs the command" "false && git() { :; }; git stash clear" "$WT" DENY "linked worktree"
+check "skipped if-branch definition"        "if false; then git() { :; }; fi; git stash pop" "$WT" DENY "linked worktree"
+check "definite definition shadows the command" "git() { :; }; git stash clear" "$WT" ALLOW
+check "cd after return does not carry"      "f() { return; cd $SOLO; }; f; git stash clear" "$MAIN" DENY "could not resolve"
+check "cd before return carries"            "f() { cd $SOLO; return; }; f; git stash pop" "$WT" ALLOW
+check "eval return leaves the function"     "f() { eval return; cd $SOLO; }; f; git stash clear" "$MAIN" DENY "could not resolve"
+check "too-deep current-shell body taints cwd" "enter() { cd $MAIN; }; eval 'eval \"eval enter\"'; git stash clear" "$SOLO" DENY "could not resolve"
+check "scoped var is exported into a function" "GIT_DIR=$SOLO/.git; f() { git stash clear; }; GIT_DIR=$MAIN/.git f" "$SOLO" DENY
+check "scoped export is undone after the call" "GIT_DIR=$MAIN/.git; f() { :; }; GIT_DIR=$SOLO/.git f; git stash pop" "$SOLO" ALLOW
 check "CDPATH steers a relative cd"         "CDPATH=$T; cd main.wt; git stash clear" "$PLAIN" DENY "linked worktree"
 mkdir -p "$PLAIN/main.wt"
 check "CDPATH wins over a local match"      "CDPATH=$T; cd main.wt; git stash clear" "$PLAIN" DENY "linked worktree"

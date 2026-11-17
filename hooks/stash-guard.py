@@ -114,6 +114,7 @@ MAX_DEPTH = 3                             # nested shell/eval bodies scanned
 GIT_TARGET = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
 CONFIG_HOME = ("HOME", "XDG_CONFIG_HOME")  # select git's global config file
 FUNC = "\0f"                              # env key prefix: a shell function's bodies
+                                          # (None among them: it may be undefined)
 # Every git probe shares one budget, kept under the hook's registered 10s
 # timeout: a timed-out hook blocks nothing, so the deny must come first.
 BUDGET = float(os.environ.get("STASH_GUARD_BUDGET") or 7)
@@ -683,9 +684,9 @@ def merge(cwd, env, cwd2, env2):
     two disagree on is unknown (None), an env var they disagree on UNCERTAIN."""
     out = dict(env)
     for k in set(env) | set(env2):
-        if k.startswith(FUNC):            # either body may be the one defined
-            a = env.get(k, ())
-            out[k] = a + tuple(b for b in env2.get(k, ()) if b not in a)
+        if k.startswith(FUNC):            # either body may be the one defined,
+            a = env.get(k, (None,))       # and a side without one may have none
+            out[k] = a + tuple(b for b in env2.get(k, (None,)) if b not in a)
         elif env.get(k) != env2.get(k):
             out[k] = UNCERTAIN
     return (cwd if cwd == cwd2 else None), out
@@ -729,9 +730,10 @@ def judge(cmd, cwd, env, depth=0):
     return scan(cmd, cwd, env, depth)[0]
 
 
-def scan(cmd, cwd, env, depth):
+def scan(cmd, cwd, env, depth, rets=None):
     """(deny reason or None, cwd, env) after `cmd`. Tracks cd and plain
     assignments across segments; a subshell's are undone when it closes.
+    The state at each `return` is appended to `rets` (see run_here).
     A step in an and-or list may not have run, so once the list ends (or an
     `||` follows it) a cwd it changed is unknown and an env var it changed
     UNCERTAIN. Pipeline elements before the last and a backgrounded list run
@@ -743,6 +745,7 @@ def scan(cmd, cwd, env, depth):
     cond = piped = False
     func, fdepth, skip = None, 0, 0       # state at a `f() {` definition, its { } depth
     fname, fbody = None, []               # the function being defined, its segments
+    rets = [] if rets is None else rets
     segs = (list(cmd) if isinstance(cmd, list) else segments(cmd)) + [SEP]
     for idx, seg in enumerate(segs):
         if skip:
@@ -842,11 +845,23 @@ def scan(cmd, cwd, env, depth):
         head = toks[0]
         if FUNC + head in env:            # a call: the body runs here, in this state
             bodies = env[FUNC + head]
-            reason, cwd, env = run_here([list(b) for b, _ in bodies],
-                                        [t for _, t in bodies], cwd, env,
-                                        scoped, depth)
+            defs = [b for b in bodies if b is not None]
+            reason, c, e = run_here([list(b) for b, _ in defs],
+                                    [t for _, t in defs], cwd, env, scoped,
+                                    depth)
             if reason:
                 return reason, cwd, env
+            if None in bodies:            # its definition may have been skipped:
+                rest = {k: v for k, v in env.items() if k != FUNC + head}
+                reason, c2, e2 = scan([seg], cwd, rest, depth)  # then it is a command
+                if reason:
+                    return reason, cwd, env
+                e2.setdefault(FUNC + head, bodies)
+                c, e = merge(c, e, c2, e2)
+            cwd, env = c, e
+            continue
+        if head == "return":              # the function's state may end here
+            rets.append((cwd, dict(env)))
             continue
         if head in ("export", "unset"):
             opts = "".join(t[1:] for t in toks[1:] if t.startswith("-"))
@@ -926,7 +941,7 @@ def scan(cmd, cwd, env, depth):
                 continue
             if name == "eval":            # eval shares this shell: its cd/exports stay
                 reason, cwd, env = run_here(scripts, scripts, cwd, env, scoped,
-                                            depth)
+                                            depth, rets)
                 if reason:
                     return reason, cwd, env
                 continue
@@ -975,32 +990,52 @@ def body_unresolved(texts, e):
             "unresolvable mutating stash is denied by default. " + ALTERNATIVES)
 
 
-def run_here(scripts, texts, cwd, env, scoped, depth):
+def invalidated(env):
+    """(cwd, env) after a body that runs in this shell went uninspected: any
+    cwd, var or export it touched is unknown, git's target vars included."""
+    out = {k: (v if k.startswith(FUNC) else UNCERTAIN) for k, v in env.items()}
+    out.update(dict.fromkeys(GIT_TARGET + CONFIG_HOME, UNCERTAIN))
+    return None, out
+
+
+def run_here(scripts, texts, cwd, env, scoped, depth, rets=None):
     """(deny reason or None, cwd, env) after bodies run in this shell (an
     `eval`, a function call): each alternative is scanned in the caller's
     state, readings that disagree leave it uncertain, its cd / exports stay,
-    and a command-scoped `A=b` lasts only for the call. `texts` are the
-    bodies as text, for the depth bar."""
+    and a command-scoped `A=b` is exported for the call and lasts only for
+    it. `texts` are the bodies as text, for the depth bar. A `return` in an
+    eval leaves the function that runs it, so an eval passes its caller's
+    `rets`; a function call (`rets` None) collects its own, and its state
+    afterwards is uncertain wherever a `return` state and its end disagree."""
     if depth >= MAX_DEPTH:
-        return nested_bar(texts, depth), cwd, env
+        reason = nested_bar(texts, depth)
+        return (reason, cwd, env) if reason else (None, *invalidated(env))
     try:
         body_env = with_scoped(env, scoped)
     except Unresolved as e:
-        return body_unresolved(texts, e), cwd, env
+        reason = body_unresolved(texts, e)
+        return (reason, cwd, env) if reason else (None, *invalidated(env))
+    for k in scoped:
+        body_env.pop(LOCAL + k, None)
     outs = []
     for s in scripts:
-        reason, c, e = scan(s, cwd, dict(body_env), depth + 1)
+        own = [] if rets is None else rets
+        reason, c, e = scan(s, cwd, dict(body_env), depth + 1, own)
         if reason:
             return reason, cwd, env
+        if rets is None:
+            for rc, renv in own:
+                c, e = merge(c, e, rc, renv)
         outs.append((c, e))
     cwd, after = outs[0]
     for c, e in outs[1:]:
         cwd, after = merge(cwd, after, c, e)
     for k in scoped:
-        if k in env:
-            after[k] = env[k]
-        else:
-            after.pop(k, None)
+        for key in (k, LOCAL + k):
+            if key in env:
+                after[key] = env[key]
+            else:
+                after.pop(key, None)
     return None, cwd, after
 
 
