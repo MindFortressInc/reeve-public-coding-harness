@@ -104,12 +104,14 @@ NOT_A_REPO = re.compile(r"not a git repository|cannot change to|must be run in a
 SHELL_C = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
 FUNC_DEF = re.compile(r"\s*(?:function\s+)?[^\s'\"\\$`=;&|<>(){}]+\s*")
 VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+POSITIONAL = re.compile(r'"\$(?:@|\{@\})"|\$(?:\{(\d+|[@*])\}|(\d|[@*]))')
 SUBST = "$(...)"                          # opaque stand-in for a $(...)
 OPEN, CLOSE = "\0(", "\0)"                 # subshell scope markers from segments()
 AND, OR, SEP = "\0&", "\0|", "\0;"         # && / || / (; newline) from segments()
 PIPE, BG = "\0p", "\0b"                    # | or |& / a lone & from segments()
 UNCERTAIN = "\0?"                         # env value: a step that may not have run set it
 LOCAL = "\0l"                             # env key prefix: that var is set but not exported
+EXPORT = "\0x"                            # env key prefix: that var is exported but not set
 MAX_DEPTH = 3                             # nested shell/eval bodies scanned
 GIT_TARGET = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
 CONFIG_HOME = ("HOME", "XDG_CONFIG_HOME")  # select git's global config file
@@ -649,7 +651,7 @@ def exported_env(env, scoped):
     A command-scoped VAR=val always reaches the child; a var whose export may
     not have run is UNCERTAIN."""
     out = {k: v for k, v in with_scoped(env, scoped).items()
-           if not k.startswith(FUNC)}
+           if not k.startswith((FUNC, EXPORT))}
     for k in [k for k in out if k.startswith(LOCAL)]:
         name, flag = k[len(LOCAL):], out.pop(k)
         if name in scoped or name not in out:
@@ -693,8 +695,8 @@ def merge(cwd, env, cwd2, env2):
 
 
 def shell_c_body(args):
-    """The command string of `sh [options] -c string ...`, or None without
-    -c. Every option is parsed first (`-o` / `-O` / `+o` / `+O` take a
+    """(command string, the words after it) of `sh [options] -c string
+    ...`, or (None, []) without -c. Every option is parsed first (`-o` / `-O` / `+o` / `+O` take a
     value, `--rcfile` / `--init-file` too, `--` / `-` end them), so the string
     is the first word after the options wherever -c sits among them."""
     has_c, i = False, 0
@@ -716,7 +718,21 @@ def shell_c_body(args):
             has_c = True
         if t[-1] in "oO":                 # -o pipefail / -euo pipefail
             i += 1
-    return args[i] if has_c and i < len(args) else None
+    return (args[i], args[i + 1:]) if has_c and i < len(args) else (None, [])
+
+
+def forward(body, args):
+    """`body` with the positional parameters `sh -c body $0 $1 ...` gives it
+    expanded: `"$@"` as one quoted word per argument after $0, `$@` / `$*`
+    as those words joined, `$N` / `${N}` as the Nth word ($0 the first)."""
+    def sub(m):
+        if m.group(0).startswith('"'):
+            return " ".join(shlex.quote(a) for a in args[1:])
+        k = m.group(1) or m.group(2)
+        if k in "@*":
+            return " ".join(args[1:])
+        return args[int(k)] if int(k) < len(args) else ""
+    return POSITIONAL.sub(sub, body)
 
 
 def may_stash(text):
@@ -835,8 +851,10 @@ def scan(cmd, cwd, env, depth, rets=None):
             for k, v in scoped.items():   # bare `A=b` sets shell state
                 if v is None:
                     continue
-                if k not in env:          # a new var stays unexported
-                    env[LOCAL + k] = "1"
+                if k not in env:          # a new var stays unexported, unless
+                    flag = env.pop(EXPORT + k, None)  # `export k` ran while unset
+                    if flag != "1":
+                        env[LOCAL + k] = UNCERTAIN if flag == UNCERTAIN else "1"
                 try:
                     env[k] = expand(v, env)
                 except Unresolved:
@@ -875,6 +893,7 @@ def scan(cmd, cwd, env, depth, rets=None):
                     else:
                         env.pop(k, None)
                         env.pop(LOCAL + k, None)
+                        env.pop(EXPORT + k, None)
                     continue
                 if eq:
                     try:
@@ -883,8 +902,11 @@ def scan(cmd, cwd, env, depth, rets=None):
                         env[k] = UNCERTAIN
                 if "n" in opts:           # export -n: set, but no longer exported
                     env[LOCAL + k] = "1"
+                    env.pop(EXPORT + k, None)
                 else:
                     env.pop(LOCAL + k, None)
+                    if k not in env:      # the export outlives the unset value
+                        env[EXPORT + k] = "1"
             continue
         if head in ("cd", "pushd", "popd"):
             if head == "pushd" and any(re.fullmatch(r"-[A-Za-z]*n[A-Za-z]*", a)
@@ -926,11 +948,15 @@ def scan(cmd, cwd, env, depth, rets=None):
         name = os.path.basename(head)
         if name in SHELLS or name == "eval":
             if name == "eval":
-                raw = " ".join(toks[1:])
+                raw, pos = " ".join(toks[1:]), []
             else:                         # -c, or a cluster like -lc / -ec
-                raw = shell_c_body(toks[1:])
+                raw, pos = shell_c_body(toks[1:])
             if raw:
                 scripts = variants(raw, env)  # `eval "$CMD"` runs what $CMD holds
+                if pos:                   # `bash -c '"$@"' _ git stash`: the body runs its args
+                    args = [substitute(a, env) for a in pos]
+                    scripts = list(dict.fromkeys([forward(b, args)
+                                                  for b in scripts] + scripts))
             elif name == "eval":
                 continue
             else:                         # `bash <<EOF` / `bash <<< ...`: stdin is the script
@@ -1031,7 +1057,7 @@ def run_here(scripts, texts, cwd, env, scoped, depth, rets=None):
     for c, e in outs[1:]:
         cwd, after = merge(cwd, after, c, e)
     for k in scoped:
-        for key in (k, LOCAL + k):
+        for key in (k, LOCAL + k, EXPORT + k):
             if key in env:
                 after[key] = env[key]
             else:
@@ -1100,7 +1126,7 @@ def judge_git(args, cwd, env, scoped=None, depth=0):
     git_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     if not isinstance(seen, Unresolved):
         git_env.update({k: v for k, v in seen.items()
-                        if k.startswith("GIT_CONFIG") and v != UNCERTAIN})
+                        if config_var(k) and v != UNCERTAIN})
         for k in CONFIG_HOME:             # where git finds its global config
             if k not in seen:
                 git_env.pop(k, None)
@@ -1124,7 +1150,8 @@ def judge_git(args, cwd, env, scoped=None, depth=0):
                                        "directory is unknown") or \
             (seen if isinstance(seen, Unresolved) else None) or \
             next((f"${k} is set by a step that may not have run"
-                  for k in GIT_TARGET if seen.get(k) == UNCERTAIN), None)
+                  for k in (*GIT_TARGET, *CONFIG_HOME, *sorted(filter(config_var, seen)))
+                  if seen.get(k) == UNCERTAIN), None)
         return judge_alias(rest, target, git_dir, work_tree, configs,
                            config_unresolved, seen, git_env, depth,
                            str(where) if where else None)
@@ -1156,6 +1183,12 @@ def judge_git(args, cwd, env, scoped=None, depth=0):
         reason += (f", and a word of it could not be resolved ({opaque}), "
                    f"so it may be a mutating stash")
     return f"[stash-guard] Blocked {label}: {reason}. " + ALTERNATIVES
+
+
+def config_var(k):
+    """Whether env var `k` picks config every git command reads, so an alias
+    too. GIT_CONFIG is read by `git config` alone, never by the alias run."""
+    return k.startswith("GIT_CONFIG") and k != "GIT_CONFIG"
 
 
 def is_git_command(name, git_env):

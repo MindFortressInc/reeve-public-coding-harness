@@ -254,6 +254,17 @@ check "real command with unresolved -C"     "git -C \"\$(printf $MAIN)\" submodu
 check "alias after an uncertain cd"         "cd $MAIN || true; git wipe"      "$SOLO" DENY "could not resolve"
 check "alias chain past the depth bound"    "git -c alias.a=b -c alias.b=c -c alias.c=d -c alias.d=e -c 'alias.e=stash clear' a" "$WT" DENY "nested too deeply"
 check "deep alias chain ending in a builtin" "git -c alias.a=b -c alias.b=c -c alias.c=d -c alias.d=status a" "$WT" ALLOW
+check "bash -c forwards \"\$@\""             "bash -c '\"\$@\"' _ git stash clear" "$WT" DENY "linked worktree"
+check "bash -c forwards \$@ into git"        "bash -c 'git \"\$@\"' _ stash pop" "$WT" DENY "linked worktree"
+check "sh -c forwards \$1 as the command"    "sh -c '\$1 stash pop' _ git"     "$WT" DENY "linked worktree"
+check "bash -c forwards a read-only stash"   "bash -c '\"\$@\"' _ git stash list" "$WT" ALLOW
+check "bash -c echoes forwarded args"        "bash -c 'echo \"\$@\"' _ git stash pop" "$WT" ALLOW
+check "uncertain HOME fails the alias closed" "true && export HOME=$T/althome; git wipe" "$WT" DENY "could not resolve"
+check "uncertain HOME, builtin"              "true && export HOME=$T/althome; git status" "$WT" ALLOW
+check "export before assignment reaches git" "export GIT_DIR; GIT_DIR=$MAIN/.git; git stash clear" "$SOLO" DENY "other worktree"
+check "unset drops an export made unset"     "export GIT_DIR; unset GIT_DIR; GIT_DIR=$MAIN/.git; git stash clear" "$SOLO" ALLOW
+check "uncertain export before assignment"   "false && export GIT_DIR; GIT_DIR=$MAIN/.git; git stash clear" "$SOLO" DENY "may not have run"
+check "GIT_CONFIG does not hide an alias"    "GIT_CONFIG=/dev/null git shelf2" "$WT" DENY "linked worktree"
 mkdir -p "$T/bin"; REAL_GIT=$(command -v git)
 printf '#!/bin/sh\nfor a; do [ "$a" = worktree ] && exit 1; done\nexec %s "$@"\n' "$REAL_GIT" > "$T/bin/git"; chmod +x "$T/bin/git"
 PATH="$T/bin:$PATH" \
