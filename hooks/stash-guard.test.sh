@@ -3,6 +3,10 @@
 # Builds throwaway repos (a main checkout with one linked worktree, a solo repo
 # with none, and a plain directory) and feeds the hook real PreToolUse payloads.
 # Nothing here ever runs `git stash`; the hook is only asked to judge it.
+# `VAR=val check ...` below scopes VAR to one call only in bash's default mode;
+# sh / POSIX mode keeps it set afterwards, leaking a fake PATH into later checks.
+[ -n "${BASH_VERSION:-}" ] || { echo "run with bash: bash $0" >&2; exit 2; }
+set +o posix
 HOOK="$(cd "$(dirname "$0")" && pwd)/stash-guard.py"
 pass=0; fail=0
 T=$(cd "$(mktemp -d)" && pwd -P); trap 'rm -rf "$T"' EXIT
@@ -11,7 +15,10 @@ unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
 g() { git -c user.email=t@t -c user.name=t -c init.defaultBranch=main "$@" >/dev/null 2>&1; }
 MAIN="$T/main"; WT="$T/main.wt"; SOLO="$T/solo"; PLAIN="$T/plain"
 mkdir -p "$MAIN" "$SOLO" "$PLAIN"
-for r in "$MAIN" "$SOLO"; do g -C "$r" init && echo x > "$r/f" && g -C "$r" add f && g -C "$r" commit -m init; done
+for r in "$MAIN" "$SOLO"; do
+  g -C "$r" init && echo x > "$r/f" && g -C "$r" add f && g -C "$r" commit -m init \
+    || { echo "setup failed: cannot create repo at $r"; exit 1; }
+done
 g -C "$MAIN" worktree add "$WT" -b wt-branch
 [ -f "$WT/.git" ] || { echo "setup failed: no linked worktree at $WT"; exit 1; }
 
@@ -21,8 +28,9 @@ j() { python3 -c 'import json,sys; print(json.dumps({"session_id":"s1","transcri
 # $1 name, $2 command, $3 cwd, $4 expect ALLOW|DENY, $5 optional substring the deny reason must contain
 # A VAR=val prefix on a check call reaches the hook process's environment
 check() {
-  out=$(j Bash "$2" "$3" | python3 "$HOOK" 2>/dev/null); rc=$?
-  if [ $rc -ne 0 ]; then fail=$((fail+1)); echo "FAIL: $1 (exit $rc)"; return; fi
+  out=$(j Bash "$2" "$3" | python3 "$HOOK" 2>"$T/stderr"); rc=$?
+  if [ $rc -ne 0 ]; then fail=$((fail+1)); echo "FAIL: $1 (exit $rc)"; sed 's/^/  /' "$T/stderr"; rm -f "$T/stderr"; return; fi
+  rm -f "$T/stderr"
   case "$4" in
     ALLOW) [ -z "$out" ] && { pass=$((pass+1)); echo "ok   ALLOW  $1"; return; } ;;
     DENY) echo "$out" | python3 -c '
@@ -212,6 +220,24 @@ check "called function's cd is uncertain"   "f() { cd $WT; }; f; git stash clear
 check "function keyword form"               "function f { cd $SOLO; }; git stash clear" "$WT" DENY
 check "function body on its own line"       $'f()\n{ cd '"$SOLO"$'; }\ngit stash clear' "$WT" DENY
 check "stash inside a function body"        "f() { git stash pop; }"          "$WT" DENY "linked worktree"
+check "loop's later pass sees its own cd"   "for i in 1 2; do git stash clear; cd $WT; done" "$SOLO" DENY "could not resolve"
+check "while loop's later pass, too"         "while true; do git stash pop; cd $MAIN; done" "$SOLO" DENY "could not resolve"
+check "loop-carried export reaches pass 2"   "for i in 1 2; do git stash pop; export GIT_DIR=$MAIN/.git; done" "$SOLO" DENY "may not have run"
+check "loop-carried value chain settles"     "C=$SOLO; B=$SOLO; for i in 1 2 3; do cd \"\$C\"; git stash pop; C=\$B; B=$WT; done" "$SOLO" DENY "could not resolve"
+check "loop that stays in one solo repo"     "for i in 1 2; do cd $SOLO; git stash pop; done" "$WT" ALLOW
+check "loop without state changes, solo"     "for i in 1 2; do git stash pop; done" "$SOLO" ALLOW
+check "command skips a shadowing function"   "git() { :; }; command git stash pop" "$WT" DENY "linked worktree"
+check "exec launcher skips the function"     "git() { :; }; exec git stash pop" "$WT" DENY "linked worktree"
+check "env launcher skips the function"      "git() { :; }; env git stash clear" "$WT" DENY "linked worktree"
+check "time keeps function lookup"           "git() { :; }; time git stash clear" "$WT" ALLOW
+check "env cd runs in a child"               "env cd $SOLO; git stash pop"     "$WT" DENY "linked worktree"
+check "nohup export runs in a child"         "nohup export GIT_DIR=$SOLO/.git; git stash pop" "$WT" DENY "linked worktree"
+check "env A=b sets no shell state"          "env PWD=$SOLO; git -C \"\$PWD\" stash pop" "$WT" DENY "linked worktree"
+check "command cd is the builtin"            "cd() { :; }; command cd $SOLO; git stash pop" "$WT" ALLOW
+check "function forwards \"\$@\""            "f() { \"\$@\"; }; f git stash pop" "$WT" DENY "linked worktree"
+check "function forwards \$1 into git"       "f() { git \"\$1\" clear; }; f stash" "$WT" DENY "linked worktree"
+check "function forwards a read-only stash"  "f() { \"\$@\"; }; f git stash list" "$WT" ALLOW
+check "function echoes forwarded args"       "f() { echo \"\$@\"; }; f git stash pop" "$WT" ALLOW
 check "function without cd, solo repo"      "f() { echo hi; }; git stash clear" "$SOLO" ALLOW
 check "env -S runs its split command"       "env -S 'git stash clear'"        "$WT" DENY "linked worktree"
 check "env -S attached operand"             "env -iS'git stash pop'"          "$WT" DENY "linked worktree"

@@ -40,14 +40,17 @@ quote removal hides which
 happens. `$VAR` command and subcommand words are expanded before matching.
 `env` / shells / `eval` / wrappers (`time -p`, `command -p`, `sudo -u X`,
 `exec -a X`, `timeout`, `nice`, `stdbuf`, `ionice`, `setsid`, `xargs`) match
-by basename like git, their options consumed.
+by basename like git, their options consumed; `command` / `builtin` skip
+shell functions, and the program launchers skip functions and run `cd` /
+`export` / `eval` in a child, not this shell. A function call fills the
+body's `$1` / `"$@"` with its arguments. A loop's later passes are rescanned
+from its merged loop-carried state until that state settles.
 A mutating stash whose target cannot be resolved (an unknown $VAR, a `$(...)`,
 a `cd` into a missing directory, a failed or timed-out repo, worktree or alias
 probe, an unresolvable command or subcommand word, shell bodies or aliases
 nested past the scan depth) is denied.
 Known gaps: a heredoc piped into a shell (`cat <<EOF | bash`) is not seen; a
-cd inside a `{ ...; }` group used as a pipeline element is not undone, and a
-loop body is scanned once, in the state its first pass sees. A crash exits
+cd inside a `{ ...; }` group used as a pipeline element is not undone. A crash exits
 non-zero, which Claude Code treats as a non-blocking error (fail open), like the other
 Bash hooks here.
 """
@@ -64,6 +67,9 @@ SHELLS = {"bash", "sh", "zsh", "dash"}
 PREFIX_WORDS = {"{", "}", "!", "then", "do", "else", "elif", "if", "while",
                 "until"}
 OPENERS = {"if", "while", "until", "for", "select", "case"}
+LOOPS = {"while", "until", "for", "select"}
+STATE_BUILTINS = {"cd", "pushd", "popd", "export", "unset", "return"}
+LOOP_PASSES = 8                           # loop-carried state converges well before this
 CLOSERS = {"fi", "done", "esac"}
 BLOCK_WORDS = OPENERS | CLOSERS | {"then", "do", "else", "elif", "{", "}", "!"}
 SUDO_LONG_WITH_VALUE = {"--user", "--group", "--prompt", "--close-from",
@@ -71,7 +77,10 @@ SUDO_LONG_WITH_VALUE = {"--user", "--group", "--prompt", "--close-from",
                         "--command-timeout", "--host"}
 # Wrappers that run a later word as the command (matched by basename):
 # (short options taking a value, long options taking a value, positional
-# words before the command). Their other options are flags.
+# words before the command). Their other options are flags. `time` is a
+# keyword and keeps shell lookup; `command` / `builtin` skip shell functions;
+# every other wrapper (and env) execs a program, so neither a function nor a
+# builtin like `cd` / `export` / `eval` runs in this shell.
 WRAPPERS = {"time": ("", (), 0), "nohup": ("", (), 0),
             "command": ("", (), 0), "builtin": ("", (), 0),
             "setsid": ("", (), 0), "exec": ("a", (), 0),
@@ -105,6 +114,7 @@ SHELL_C = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
 FUNC_DEF = re.compile(r"\s*(?:function\s+)?[^\s'\"\\$`=;&|<>(){}]+\s*")
 VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 POSITIONAL = re.compile(r'"\$(?:@|\{@\})"|\$(?:\{(\d+|[@*])\}|(\d|[@*]))')
+SHELL, NOFUNC, EXTERNAL = 0, 1, 2         # how a command word is looked up
 SUBST = "$(...)"                          # opaque stand-in for a $(...)
 OPEN, CLOSE = "\0(", "\0)"                 # subshell scope markers from segments()
 AND, OR, SEP = "\0&", "\0|", "\0;"         # && / || / (; newline) from segments()
@@ -548,9 +558,10 @@ def split_string(val):
 def strip_prefix(toks, env):
     """Drop shell keywords, wrappers and VAR=val assignments before the
     command word. Returns (remaining tokens, scoped assignments, the
-    `env -C` / `--chdir` directory words in order). A scoped value of None
-    means `env -u` / `env -i` removed that variable."""
-    scoped, chdirs = {}, []
+    `env -C` / `--chdir` directory words in order, the lookup mode: SHELL,
+    NOFUNC after `command` / `builtin`, EXTERNAL after a program launcher).
+    A scoped value of None means `env -u` / `env -i` removed that variable."""
+    scoped, chdirs, lookup = {}, [], SHELL
 
     def env_opt(opt, val):
         if opt == "u":
@@ -568,6 +579,8 @@ def strip_prefix(toks, env):
         elif os.path.basename(t) in WRAPPERS:
             wrapper, toks = os.path.basename(t), toks[1:]
             takes, long_takes, positional = WRAPPERS[wrapper]
+            lookup = max(lookup, SHELL if wrapper == "time" else NOFUNC
+                         if wrapper in ("command", "builtin") else EXTERNAL)
             while toks and toks[0].startswith("-") and toks[0] != "-":
                 o, toks = toks[0], toks[1:]
                 if o == "--":
@@ -590,7 +603,7 @@ def strip_prefix(toks, env):
                         break
             toks = toks[positional:]      # `timeout 10 git ...`: the duration
         elif os.path.basename(t) == "env":
-            toks = toks[1:]
+            toks, lookup = toks[1:], EXTERNAL
             while toks and toks[0].startswith("-"):
                 o, toks = toks[0], toks[1:]
                 if o == "--":
@@ -625,7 +638,7 @@ def strip_prefix(toks, env):
             toks = toks[1:]
         else:
             break
-    return toks, scoped, chdirs
+    return toks, scoped, chdirs, lookup
 
 
 def with_scoped(env, scoped):
@@ -832,21 +845,32 @@ def scan(cmd, cwd, env, depth, rets=None):
                     func = None
                 continue
             if w in OPENERS:              # a branch or loop body may be skipped
-                blocks.append((cwd, dict(env)))
+                blocks.append((cwd, dict(env), w in LOOPS and loop_start(segs, idx)))
             elif w in ("else", "elif") and blocks:
-                cwd, env = merge(cwd, env, *blocks[-1])
+                cwd, env = merge(cwd, env, *blocks[-1][:2])
             elif w in CLOSERS and blocks:
-                cwd, env = merge(cwd, env, *blocks.pop())
-        toks, scoped, chdirs = strip_prefix(toks, env)
+                c0, e0, start = blocks.pop()
+                cwd, env = merge(cwd, env, c0, e0)
+                if start is not False and (cwd, env) != (c0, e0):
+                    reason, cwd, env = later_passes(segs[start:idx], cwd, env,
+                                                    depth, rets)
+                    if reason:
+                        return reason, cwd, env
+        toks, scoped, chdirs, lookup = strip_prefix(toks, env)
         opaque = None
         if toks and ("$" in toks[0] or "`" in toks[0]):
             try:                          # `"$B" stash pop` runs what $B holds
                 toks = expand_word(toks[0], env) + toks[1:]
-                toks, more, dirs = strip_prefix(toks, env)
+                toks, more, dirs, how = strip_prefix(toks, env)
                 scoped.update(more)
                 chdirs += dirs
+                lookup = max(lookup, how)
             except Unresolved as e:
                 opaque = str(e)
+        if lookup == EXTERNAL and toks[:1] and toks[0] in STATE_BUILTINS:
+            continue                      # `env cd x`: a child process, not this shell
+        if lookup == EXTERNAL and not toks:
+            continue                      # `env A=b`: prints the env, sets nothing
         if not toks:
             for k, v in scoped.items():   # bare `A=b` sets shell state
                 if v is None:
@@ -861,12 +885,18 @@ def scan(cmd, cwd, env, depth, rets=None):
                     env[k] = UNCERTAIN
             continue
         head = toks[0]
-        if FUNC + head in env:            # a call: the body runs here, in this state
+        if lookup == SHELL and FUNC + head in env:  # a call: the body runs here
             bodies = env[FUNC + head]
             defs = [b for b in bodies if b is not None]
-            reason, c, e = run_here([list(b) for b, _ in defs],
-                                    [t for _, t in defs], cwd, env, scoped,
-                                    depth)
+            args = ["$0", *(substitute(a, env) for a in toks[1:])]
+            scripts, texts = [], []
+            for b, t in defs:             # `f() { "$@"; }; f git stash`: its args fill $@
+                fwd = [forward_seg(x, args) for x in b]
+                same = all(x == y and getattr(x, "docs", ()) == getattr(y, "docs", ())
+                           for x, y in zip(fwd, b))
+                scripts += [fwd] if same else [fwd, list(b)]
+                texts += [t, forward(t, args)]
+            reason, c, e = run_here(scripts, texts, cwd, env, scoped, depth)
             if reason:
                 return reason, cwd, env
             if None in bodies:            # its definition may have been skipped:
@@ -965,7 +995,7 @@ def scan(cmd, cwd, env, depth, rets=None):
                 scripts += [s for h in herestrs for s in variants(h, env)]
             if not scripts:
                 continue
-            if name == "eval":            # eval shares this shell: its cd/exports stay
+            if name == "eval" and lookup != EXTERNAL:  # eval shares this shell
                 reason, cwd, env = run_here(scripts, scripts, cwd, env, scoped,
                                             depth, rets)
                 if reason:
@@ -996,6 +1026,48 @@ def scan(cmd, cwd, env, depth, rets=None):
     if scopes:                            # an unclosed ( ends with the command
         cwd, env = scopes[0][:2]
     return None, cwd, env
+
+
+def loop_start(segs, idx):
+    """Index where the text a loop repeats begins: the segment holding its
+    opener word, plus any `$(...)` in that segment, which segments() emits
+    just before it (a `while $(cmd)` condition reruns every pass)."""
+    while idx and segs[idx - 1] == CLOSE:
+        depth, idx = 0, idx - 1
+        while idx >= 0:
+            depth += {CLOSE: 1, OPEN: -1}.get(segs[idx], 0)
+            if depth == 0:
+                break
+            idx -= 1
+    return max(idx, 0)
+
+
+def later_passes(body, cwd, env, depth, rets):
+    """(deny reason or None, cwd, env) for a loop's second and later passes.
+    `cwd` / `env` merge its start and the end of its first pass; each pass
+    rescans the condition and body from that merged state until it stops
+    changing, so a cd or export a pass makes is uncertain in the next one
+    (`for i in 1 2; do git stash clear; cd /shared; done`)."""
+    for _ in range(LOOP_PASSES):
+        reason, c, e = scan(body, cwd, dict(env), depth, rets)
+        if reason:
+            return reason, cwd, env
+        c, e = merge(cwd, env, c, e)
+        if (c, e) == (cwd, env):
+            return None, cwd, env
+        cwd, env = c, e
+    cwd, env = invalidated(env)           # never settled: trust nothing it touched
+    return scan(body, cwd, dict(env), depth, rets)[0], cwd, env
+
+
+def forward_seg(seg, args):
+    """A function body segment with the call's positional parameters
+    expanded (see forward()), its unquoted heredocs too; markers pass."""
+    if type(seg) is not Seg:
+        return seg
+    out = Seg(forward(seg, args))
+    out.docs = [(d if q else forward(d, args), q) for d, q in seg.docs]
+    return out
 
 
 def nested_bar(texts, depth):
