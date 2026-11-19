@@ -11,6 +11,11 @@ HOOK="$(cd "$(dirname "$0")" && pwd)/stash-guard.py"
 pass=0; fail=0
 T=$(cd "$(mktemp -d)" && pwd -P); trap 'rm -rf "$T"' EXIT
 unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
+# No developer git config reaches the fixtures or the hook's probes (a global
+# commit.gpgSign or alias would change results); scoped HOME= / XDG_CONFIG_HOME=
+# checks below still pick their own config dirs.
+export HOME="$T/home" GIT_CONFIG_NOSYSTEM=1; mkdir -p "$HOME"
+unset XDG_CONFIG_HOME GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
 
 g() { git -c user.email=t@t -c user.name=t -c init.defaultBranch=main "$@" >/dev/null 2>&1; }
 MAIN="$T/main"; WT="$T/main.wt"; SOLO="$T/solo"; PLAIN="$T/plain"
@@ -36,8 +41,8 @@ check() {
     DENY) echo "$out" | python3 -c '
 import json,sys
 d=json.load(sys.stdin)["hookSpecificOutput"]
-assert d["hookEventName"]=="PreToolUse" and d["permissionDecision"]=="deny", d
-assert sys.argv[1] in d["permissionDecisionReason"], d["permissionDecisionReason"]
+if d.get("hookEventName")!="PreToolUse" or d.get("permissionDecision")!="deny": sys.exit(1)
+if sys.argv[1] not in d.get("permissionDecisionReason",""): sys.exit(1)
 ' "${5:-}" 2>/dev/null && { pass=$((pass+1)); echo "ok   DENY   $1"; return; } ;;
   esac
   fail=$((fail+1)); echo "FAIL: $1 (expected $4)"; echo "  got: ${out:-<empty>}"
@@ -274,7 +279,9 @@ check "bash -c -- body"                     "bash -c -- 'git stash clear'"    "$
 check "bash -c with options after it"       "bash -c -e -o pipefail 'git stash pop'" "$WT" DENY "linked worktree"
 mkdir -p "$T/althome"; git config -f "$T/althome/.gitconfig" alias.wipe 'stash clear'
 check "scoped HOME reaches the alias probe" "HOME=$T/althome git wipe"        "$WT" DENY "linked worktree"
-check "scoped XDG_CONFIG_HOME alias probe"  "HOME=$T/nohome XDG_CONFIG_HOME=$T/xdg git wipe2" "$WT" ALLOW
+mkdir -p "$T/xdg/git"; git config -f "$T/xdg/git/config" alias.wipe2 'stash clear'
+check "scoped XDG_CONFIG_HOME alias probe"  "HOME=$T/nohome XDG_CONFIG_HOME=$T/xdg git wipe2" "$WT" DENY "linked worktree"
+check "XDG dir without the alias"           "HOME=$T/nohome XDG_CONFIG_HOME=$T/noxdg git wipe2" "$WT" ALLOW
 check "alias with an unresolved -C target"  "git -C \"\$(printf $MAIN)\" wipe" "$SOLO" DENY "could not resolve"
 check "real command with unresolved -C"     "git -C \"\$(printf $MAIN)\" submodule status" "$SOLO" ALLOW
 check "alias after an uncertain cd"         "cd $MAIN || true; git wipe"      "$SOLO" DENY "could not resolve"
@@ -291,7 +298,35 @@ check "export before assignment reaches git" "export GIT_DIR; GIT_DIR=$MAIN/.git
 check "unset drops an export made unset"     "export GIT_DIR; unset GIT_DIR; GIT_DIR=$MAIN/.git; git stash clear" "$SOLO" ALLOW
 check "uncertain export before assignment"   "false && export GIT_DIR; GIT_DIR=$MAIN/.git; git stash clear" "$SOLO" DENY "may not have run"
 check "GIT_CONFIG does not hide an alias"    "GIT_CONFIG=/dev/null git shelf2" "$WT" DENY "linked worktree"
+check "escaped space keeps # in its word"    "echo file\\ #1; git stash pop"   "$WT" DENY "linked worktree"
+check "escaped space # inside \$(...)"        "x=\$(echo a\\ #b; git stash pop)" "$WT" DENY "linked worktree"
+check "skipped cd before && is not taken"   "true || cd $SOLO && git stash pop" "$WT" DENY "could not resolve"
+check "cd && stash uses the cd target"      "cd $SOLO && git stash pop"       "$WT" ALLOW
+if [ "$(id -u)" -ne 0 ]; then
+  mkdir -p "$T/noenter"; chmod 000 "$T/noenter"
+  check "cd into an unenterable dir fails"  "cd $T/noenter; git stash pop"    "$WT" DENY "could not resolve"
+  chmod 755 "$T/noenter"
+fi
+check "for binds its one value"             "W=$SOLO; for W in $WT; do git -C \"\$W\" stash pop; done" "$PLAIN" DENY "linked worktree"
+check "for over several values is uncertain" "W=$SOLO; for W in $SOLO $WT; do git -C \"\$W\" stash pop; done" "$PLAIN" DENY "may not have run"
+check "for over a solo repo"                "for W in $SOLO; do git -C \"\$W\" stash pop; done" "$PLAIN" ALLOW
+check "glob -C target is unresolved"        "git -C main.w* stash pop"        "$T" DENY "could not resolve"
+check "brace -C target is unresolved"       "git -C {main.wt,} stash pop"     "$T" DENY "could not resolve"
+check "glob -C, read-only stash"            "git -C main.w* stash list"       "$T" ALLOW
+check "worktree add before a solo stash"    "git -C $SOLO worktree add --detach $T/new HEAD && git -C $SOLO stash" "$PLAIN" DENY "worktree add"
+check "worktree add after the stash"        "git -C $SOLO stash; git -C $SOLO worktree add --detach $T/new HEAD" "$PLAIN" ALLOW
+check "here string to a script is data"     "bash read-line.sh <<< 'git stash pop'" "$WT" ALLOW
+check "here string to bash -s is the script" "bash -s <<< 'git stash pop'"    "$WT" DENY "linked worktree"
+check "heredoc to a script is data"         $'bash read.sh <<EOF\ngit stash pop\nEOF' "$WT" ALLOW
+
 mkdir -p "$T/bin"; REAL_GIT=$(command -v git)
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> %s\nexec %s "$@"\n' "$T/argv.log" "$REAL_GIT" > "$T/bin/git"; chmod +x "$T/bin/git"
+PATH="$T/bin:$PATH" \
+check "--config-env value stays off argv"   "TOK=s3cr3t-token git --config-env=http.extraHeader=TOK zz" "$WT" ALLOW
+if grep -q s3cr3t-token "$T/argv.log"; then fail=$((fail+1)); echo "FAIL: --config-env value reached a probe argv"; else pass=$((pass+1)); echo "ok   PRIV   --config-env value kept off probe argv"; fi
+grep -q 'config-env=http.extraHeader=TOK' "$T/argv.log" && { pass=$((pass+1)); echo "ok   PRIV   --config-env passed by name"; } || { fail=$((fail+1)); echo "FAIL: --config-env not passed to the probe by name"; }
+PATH="$T/bin:$PATH" \
+check "--config-env alias via env, still judged" "A='stash clear' git --config-env=alias.s=A s" "$WT" DENY "linked worktree"
 printf '#!/bin/sh\nfor a; do [ "$a" = worktree ] && exit 1; done\nexec %s "$@"\n' "$REAL_GIT" > "$T/bin/git"; chmod +x "$T/bin/git"
 PATH="$T/bin:$PATH" \
 check "failed worktree probe fails closed"  "git stash"                       "$MAIN" DENY "could not list"
@@ -325,8 +360,8 @@ check "stash word as a branch name"         "git checkout stash"              "$
 check "empty command"                       ""                                "$WT" ALLOW
 
 # --- non-Bash tool ignored
-out=$(j Read "git stash pop" "$WT" | python3 "$HOOK" 2>/dev/null)
-if [ -z "$out" ]; then pass=$((pass+1)); echo "ok   ALLOW  non-Bash tool ignored"; else fail=$((fail+1)); echo "FAIL: non-Bash tool ignored"; fi
+out=$(j Read "git stash pop" "$WT" | python3 "$HOOK" 2>/dev/null); rc=$?
+if [ $rc -eq 0 ] && [ -z "$out" ]; then pass=$((pass+1)); echo "ok   ALLOW  non-Bash tool ignored"; else fail=$((fail+1)); echo "FAIL: non-Bash tool ignored (rc=$rc)"; fi
 
 # --- garbage stdin never crashes the hook
 out=$(printf 'not json' | python3 "$HOOK" 2>/dev/null); rc=$?
