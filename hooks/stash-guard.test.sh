@@ -187,6 +187,7 @@ check "--work-tree reaches the probe"       "git --git-dir=$T/bare.git --work-tr
 check "relative --git-dir after a later -C" "git --git-dir=.git -C $MAIN stash clear" "$SOLO" DENY "other worktree"
 check "here string fed to bash"             "bash <<< 'git stash clear'"      "$WT" DENY "linked worktree"
 check "here string to cat stays data"       "cat <<< 'git stash clear'"       "$WT" ALLOW
+check "here string is not a heredoc"        $'cat <<< text\ngit stash pop'   "$WT" DENY "linked worktree"
 check "cd in a skipped if branch"           "if false; then cd $SOLO; fi; git stash clear" "$WT" DENY "could not resolve"
 check "cd in then, stash in else"           "if false; then cd $SOLO; else git stash clear; fi" "$WT" DENY "could not resolve"
 check "cd and stash in one branch"          "if true; then cd $SOLO && git stash pop; fi" "$WT" ALLOW
@@ -252,6 +253,33 @@ check "pushd -n keeps the cwd"              "pushd -n $SOLO; git stash clear" "$
 check "pushd -n away from a worktree"       "pushd -n $WT; git stash clear"   "$SOLO" ALLOW
 check "pushd changes the cwd"               "pushd $WT; git stash clear"      "$SOLO" DENY "linked worktree"
 check "bare pushd target is untracked"      "pushd; git stash clear"          "$SOLO" DENY "unknown"
+# --- arithmetic $(( )) and unresolvable command words (both used to
+#     false-deny ordinary status / pytest commands in a linked worktree)
+check "arithmetic \$(( )) is not a command"  "echo \"age=\$(( \$(date +%s) - \$(date +%s) ))s\"" "$WT" ALLOW
+check "unquoted arithmetic assignment"      "x=\$(( 1 + 2 )); echo \$x"        "$WT" ALLOW
+check "stash in arithmetic's \$(...)"       "echo \$(( \$(git stash clear) + 0 ))" "$WT" DENY "linked worktree"
+check "read-only stash in arithmetic"       "echo \$(( \$(git stash list | wc -l) + 0 ))" "$WT" ALLOW
+check "arithmetic text spelling a stash"    "echo \$((git stash pop))"         "$WT" DENY "linked worktree"
+check "arithmetic in an unquoted heredoc"   $'cat <<EOF\n$(( $(git stash clear) + 1 ))\nEOF' "$WT" DENY "linked worktree"
+check "\$( ( ) ) stays a substitution"       "echo \$( (git stash pop) )"       "$WT" DENY "linked worktree"
+check "unresolved command word, unknown cwd" "cd $T/nope; \$NOPE_UNSET_VAR -m pytest -q" "$WT" ALLOW
+check "unresolved command word stashing, unknown cwd" "cd $T/nope; \"\$NOPE_UNSET_VAR\" stash pop" "$WT" DENY "could not be resolved"
+check "unresolved command word, configured alias" "\"\$NOPE_UNSET_VAR\" shelf2" "$WT" DENY "could not be resolved"
+check "arithmetic with a stash-list substitution" "echo \"age=\$(( \$(date +%s) - \$(git stash list | wc -l) ))s\"" "$WT" ALLOW
+check "\$(( whose # hides a ) is a substitution" $'echo $((echo hi #)\ns=sta; git ${s}sh pop))' "$WT" DENY "linked worktree"
+check "\$(( whose quoted ) is a substitution"  "echo \$((echo \")\"; s=sta; git \${s}sh pop))" "$WT" DENY "linked worktree"
+check "unresolved command word, inline alias, unknown cwd" "cd $T/nope; \"\$NOPE_UNSET_VAR\" -c alias.p='stash pop' p" "$WT" DENY "could not be resolved"
+check "unresolved command word, unresolvable -c" "\"\$NOPE_UNSET_VAR\" -c \"alias.p=\$NOPE_UNSET_VAR\" p" "$WT" DENY "could not be resolved"
+check "unresolved command word, uncertain HOME" "true && export HOME=$T/althome; \"\$NOPE_UNSET_VAR\" wipe" "$WT" DENY "could not be resolved"
+check "\$(( with escaped parens is a substitution" "echo \$((: \\(\\); git sta\${x}sh pop))" "$WT" DENY "linked worktree"
+check "unresolved command word, env-config alias" "cd $T/nope; GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0=stash \"\$NOPE_UNSET_VAR\" p" "$WT" DENY "could not be resolved"
+check "GIT_CONFIG_NOSYSTEM defines no alias" "cd $T/nope; GIT_CONFIG_NOSYSTEM=1 \"\$NOPE_UNSET_VAR\" -m pytest" "$WT" ALLOW
+check "GIT_CONFIG_GLOBAL may define an alias" "cd $T/nope; GIT_CONFIG_GLOBAL=$T/althome/.gitconfig \"\$NOPE_UNSET_VAR\" wipe" "$WT" DENY "could not be resolved"
+check "unresolved command word, -c include.path" "cd $T/nope; \"\$NOPE_UNSET_VAR\" -c include.path=/dev/null p" "$WT" DENY "could not be resolved"
+STASH_GUARD_BUDGET=7s \
+check "malformed budget override still guards" "git stash pop"                  "$WT" DENY "linked worktree"
+STASH_GUARD_BUDGET=nan \
+check "non-finite budget override still guards" "git stash pop"                 "$WT" DENY "linked worktree"
 
 check "env -S \\_ separates words"          "env -S 'git\\_stash\\_clear'"   "$WT" DENY "linked worktree"
 check "env -S \\_ in double quotes is a space" "env -S '\"git\\_stash\" clear'" "$WT" ALLOW

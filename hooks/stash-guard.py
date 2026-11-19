@@ -38,6 +38,8 @@ the worktree's top level) are scanned too; a body is judged both with the
 caller's $VARs expanded first and with the body expanding them itself, since
 quote removal hides which
 happens. `$VAR` command and subcommand words are expanded before matching.
+An arithmetic `$(( ))` is not a command: only the substitutions inside it
+(and its text, if it may spell a stash) are scanned.
 `env` / shells / `eval` / wrappers (`time -p`, `command -p`, `sudo -u X`,
 `exec -a X`, `timeout`, `nice`, `stdbuf`, `ionice`, `setsid`, `xargs`) match
 by basename like git, their options consumed; `command` / `builtin` skip
@@ -53,7 +55,12 @@ directory, a failed or timed-out repo, worktree or alias
 probe, an unresolvable command or subcommand word, shell bodies or aliases
 nested past the scan depth) is denied.
 Known gaps: a heredoc piped into a shell (`cat <<EOF | bash`) is not seen; a
-cd inside a `{ ...; }` group used as a pipeline element is not undone. A crash exits
+cd inside a `{ ...; }` group used as a pipeline element is not undone; an
+unresolvable command word (`$PY -m pytest`) is checked for configured aliases
+only where its repo is known, so `$G shelf` after an uncertain cd is not seen;
+an unresolvable command word naming a wrapper or shell (`"$SUDO" git stash`,
+`"$SH" -c ...`) is judged as git, so its command is not seen; bash's
+arithmetic evaluation of a variable holding `a[$(...)]` is not seen. A crash exits
 non-zero, which Claude Code treats as a non-blocking error (fail open), like the other
 Bash hooks here.
 """
@@ -117,6 +124,8 @@ SHELL_C = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
 FUNC_DEF = re.compile(r"\s*(?:function\s+)?[^\s'\"\\$`=;&|<>(){}]+\s*")
 VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 GLOB = re.compile(r"[*?]|\[.*\]|\{.*(?:,|\.\.).*\}")  # pathname / brace expansion
+# Env vars that can define config (an alias) without a repo: not e.g. GIT_CONFIG_NOSYSTEM.
+ALIAS_ENV = re.compile(r"GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM)")
 POSITIONAL = re.compile(r'"\$(?:@|\{@\})"|\$(?:\{(\d+|[@*])\}|(\d|[@*]))')
 SHELL, NOFUNC, EXTERNAL = 0, 1, 2         # how a command word is looked up
 SUBST = "$(...)"                          # opaque stand-in for a $(...)
@@ -133,7 +142,12 @@ FUNC = "\0f"                              # env key prefix: a shell function's b
                                           # (None among them: it may be undefined)
 # Every git probe shares one budget, kept under the hook's registered 10s
 # timeout: a timed-out hook blocks nothing, so the deny must come first.
-BUDGET = float(os.environ.get("STASH_GUARD_BUDGET") or 7)
+try:                                      # a malformed override must not crash the hook
+    BUDGET = float(os.environ.get("STASH_GUARD_BUDGET") or 7)
+except ValueError:
+    BUDGET = 7
+if not 0 < BUDGET <= 7:                   # nan, inf, <= 0 or past the cap: the default
+    BUDGET = 7
 DEADLINE = time.monotonic() + BUDGET
 # Set once a `git worktree add` is seen earlier in the request: the probe ran
 # before it, so a checkout it lists as solo may have a worktree by the stash.
@@ -204,13 +218,56 @@ def close_backtick(s, i):
     return n
 
 
+def bare_close(s, i):
+    """Index of the `)` closing the `(` whose body starts at `i`, counting
+    every paren (no quote or comment rules), or -1 when it is never closed."""
+    depth = 1
+    for k in range(i, len(s)):
+        depth += {"(": 1, ")": -1}.get(s[k], 0)
+        if depth == 0:
+            return k
+    return -1
+
+
+def without_substitutions(text):
+    """`text` with each `$(...)` / backquote substitution replaced by `0`."""
+    out, i = [], 0
+    while i < len(text):
+        if text[i] == "\\":
+            out.append(text[i:i + 2])
+            i += 2
+        elif text[i] == "`":              # skip the span; never reparse it
+            i = close_backtick(text, i + 1) + 1
+            out.append("0")
+        elif text.startswith("$(", i):
+            i = close_paren(text, i + 2) + 1
+            out.append("0")
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
 def substitution(s, i):
-    """(body, end) of the `$(...)` or backquote substitution at `i`."""
+    """(bodies, end) of the `$(...)`, backquote or `$((...))` expansion at
+    `i`: the scripts it runs. A `$((...))` is arithmetic only when the plain
+    paren count (what the shell uses to find `))`) agrees with the quote-aware
+    one and it holds no backslash (zsh does not count an escaped paren the
+    way bash does); it then runs only the substitutions inside it, plus its
+    whole text when what is left may spell a stash. Otherwise it is a
+    `$( (...) )`."""
     if s[i] == "`":
         j = close_backtick(s, i + 1)
-        return re.sub(r"\\([$`\\])", r"\1", s[i + 1:j]), j + 1
+        return [re.sub(r"\\([$`\\])", r"\1", s[i + 1:j])], j + 1
     j = close_paren(s, i + 2)
-    return s[i + 2:j], j + 1
+    body = s[i + 2:j]
+    if body[:1] == "(" and body[-1:] == ")" and "\\" not in body and \
+            close_paren(body, 1) == len(body) - 1 == bare_close(body, 1) and \
+            bare_close(s, i + 2) == j:
+        inner = body[1:-1]
+        rescan = [inner] if may_stash(without_substitutions(inner)) else []
+        return expansions(inner) + rescan, j + 1
+    return [body], j + 1
 
 
 def expansions(text):
@@ -222,8 +279,8 @@ def expansions(text):
             i += 2
             continue
         if text[i] == "`" or text.startswith("$(", i):
-            body, i = substitution(text, i)
-            out.append(body)
+            bodies, i = substitution(text, i)
+            out += bodies
             continue
         i += 1
     return out
@@ -313,8 +370,8 @@ def segments(s):
         c = s[i]
         if q:
             if q == '"' and (c == "`" or s.startswith("$(", i)):
-                body, i = substitution(s, i)
-                segs += [OPEN, *segments(body), CLOSE]
+                bodies, i = substitution(s, i)
+                segs += [x for b in bodies for x in (OPEN, *segments(b), CLOSE)]
                 buf.append(SUBST)
                 continue
             buf.append(c)
@@ -343,7 +400,11 @@ def segments(s):
             while i < n and s[i] != "\n":
                 i += 1
             continue
-        if c == "<" and s.startswith("<<", i) and not s.startswith("<<<", i):
+        if s.startswith("<<<", i):        # a here string: its second < is no heredoc
+            buf.append("<<<")
+            i += 3
+            continue
+        if c == "<" and s.startswith("<<", i):
             m = HEREDOC.match(s, i)
             if m:
                 pending.append((m.group(1) == "-", heredoc_word(m.group(2)),
@@ -352,8 +413,8 @@ def segments(s):
                 i = m.end()
                 continue
         if c == "`" or s.startswith("$(", i):
-            body, i = substitution(s, i)  # body runs first; outer sees a token
-            segs += [OPEN, *segments(body), CLOSE]
+            bodies, i = substitution(s, i)  # bodies run first; outer sees a token
+            segs += [x for b in bodies for x in (OPEN, *segments(b), CLOSE)]
             buf.append(SUBST)
             continue
         if (c == "&" and (s.startswith("&>", i) or (buf and buf[-1] in "<>"))) \
@@ -1009,7 +1070,7 @@ def scan(cmd, cwd, env, depth, rets=None):
         except Unresolved:
             run_cwd = None
         if opaque:                        # judge it as if the word expands to git
-            if judge_git(toks[1:], run_cwd, env, scoped, depth):
+            if judge_git(toks[1:], run_cwd, env, scoped, depth, opaque_cmd=True):
                 return ("[stash-guard] Blocked a command whose name could not "
                         f"be resolved ({opaque}): run as git, it is a mutating "
                         "stash on a shared stack, and an unresolvable mutating "
@@ -1202,12 +1263,17 @@ def blocked(label, why):
             f"by default. " + ALTERNATIVES)
 
 
-def judge_git(args, cwd, env, scoped=None, depth=0):
+def judge_git(args, cwd, env, scoped=None, depth=0, opaque_cmd=False):
     """Deny reason for one git invocation's argv (after `git`), or None.
     `env` expands the argv (the shell expands words before a command-scoped
     VAR=val takes effect); `scoped` only reaches git's own environment.
     `--git-dir` / `--work-tree` stay as written: git resolves a relative one
-    after every `-C`, and so does the probe, which gets the same options."""
+    after every `-C`, and so does the probe, which gets the same options.
+    `opaque_cmd`: the command word itself is unresolvable (`$PY -m pytest`),
+    so when the repo is unknown and nothing on the line or in the env can
+    define an alias (`-c alias.<word>` / `include.*`, an unresolvable `-c`,
+    GIT_CONFIG_* vars), no alias lookup is attempted: failing closed there
+    would deny every `$VAR args` after an uncertain cd."""
     scoped = scoped or {}
     target, git_dir, work_tree, configs, i = cwd, None, None, [], 0
     pending_unresolved = config_unresolved = None
@@ -1285,6 +1351,17 @@ def judge_git(args, cwd, env, scoped=None, depth=0):
             next((f"${k} is set by a step that may not have run"
                   for k in (*GIT_TARGET, *CONFIG_HOME, *sorted(filter(config_var, seen)))
                   if seen.get(k) == UNCERTAIN), None)
+        repo_unknown = pending_unresolved or target is None or \
+            (not isinstance(seen, Unresolved) and
+             any(seen.get(k) == UNCERTAIN for k in GIT_TARGET))
+        keys = [(c.split("=", 1)[0] if isinstance(c, str) else c[0]).lower()
+                for c in configs]         # --config-env entries are (key, var, val)
+        on_line = isinstance(seen, Unresolved) or config_unresolved or \
+            f"alias.{rest[0].lower()}" in keys or \
+            any(k.startswith(("include.", "includeif.")) for k in keys) or \
+            any(ALIAS_ENV.fullmatch(k) for k in seen)
+        if opaque_cmd and repo_unknown and not on_line:
+            return None                   # no repo whose config could define it
         return judge_alias(rest, target, git_dir, work_tree, configs,
                            config_unresolved, seen, git_env, depth,
                            str(where) if where else None)
