@@ -7,7 +7,7 @@
 # sh / POSIX mode keeps it set afterwards, leaking a fake PATH into later checks.
 [ -n "${BASH_VERSION:-}" ] || { echo "run with bash: bash $0" >&2; exit 2; }
 set +o posix
-HOOK="$(cd "$(dirname "$0")" && pwd)/stash-guard.py"
+HOOK="$(CDPATH= cd "$(dirname "$0")" && pwd)/stash-guard.py"  # CDPATH= : cd prints nothing
 pass=0; fail=0
 T=$(cd "$(mktemp -d)" && pwd -P); trap 'rm -rf "$T"' EXIT
 unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
@@ -15,7 +15,7 @@ unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
 # commit.gpgSign or alias would change results); scoped HOME= / XDG_CONFIG_HOME=
 # checks below still pick their own config dirs.
 export HOME="$T/home" GIT_CONFIG_NOSYSTEM=1; mkdir -p "$HOME"
-unset XDG_CONFIG_HOME GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
+unset XDG_CONFIG_HOME GIT_CONFIG GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
 
 g() { git -c user.email=t@t -c user.name=t -c init.defaultBranch=main "$@" >/dev/null 2>&1; }
 MAIN="$T/main"; WT="$T/main.wt"; SOLO="$T/solo"; PLAIN="$T/plain"
@@ -432,6 +432,35 @@ check "cd with a failing redirection"       "cd $SOLO > $T/missing/log; git stas
 check "cd >/dev/null still lands"           "cd $SOLO >/dev/null && git stash pop" "$WT" ALLOW
 check "reason says to verify HEAD first"    "git stash"                       "$WT" DENY "still prints that sha"
 check "uncertain discovery var fails closed" "if true; then export GIT_DISCOVERY_ACROSS_FILESYSTEM=1; fi; git stash pop" "$SOLO" DENY "may not have run"
+
+# --- CodeRabbit round 9
+check "( )-bodied function is recorded"     "save() ( git stash push ); cd $WT; save" "$SOLO" DENY "linked worktree"
+check "( )-bodied function's cd is scoped"  "f() ( cd $WT ); f; git stash pop" "$SOLO" ALLOW
+check "function run by trap still judged"   "cleanup() { git stash pop; }; trap cleanup EXIT" "$WT" DENY "linked worktree"
+check "GNU env -S reads a var before -u"    "D=-C env -u D -S '\${D} $WT git stash pop'" "$SOLO" DENY "GNU and BSD"
+check "cd 2>&9 may fail (fd 9 closed)"      "cd $SOLO 2>&9; git stash pop"   "$WT" DENY "could not resolve"
+check "cd >1 is a file named 1"             "cd $SOLO >1; git stash pop"     "$WT" DENY "could not resolve"
+check "cd >&2 / 2>&- still land"            "cd $SOLO >&2 2>&-; git stash pop" "$WT" ALLOW
+check "git \$opts splits into options"       "opts='-C $WT'; git \$opts stash pop" "$SOLO" DENY "linked worktree"
+check "git \$opts, solo target"              "opts='-C $SOLO'; git \$opts stash pop" "$WT" ALLOW
+check "worktree add, then -C the new path"  "git worktree add --detach $T/new.wt HEAD && git -C $T/new.wt stash pop" "$SOLO" DENY "may create"
+check "export with a failing redirection"   "export GIT_DIR=$SOLO/.git >$T/missing/log; git stash pop" "$WT" DENY "may not have run"
+check "unset with a failing redirection"    "export GIT_DIR=$MAIN/.git/worktrees/main.wt; unset GIT_DIR >$T/missing/log; git stash pop" "$SOLO" DENY "may not have run"
+check "export >/dev/null still exports"     "export GIT_DIR=$SOLO/.git >/dev/null; git stash pop" "$WT" ALLOW
+check "local does not resolve the outer var" "dest=$SOLO; f() { local dest=$WT; git -C \"\$dest\" stash pop; }; f" "$SOLO" DENY "may not have run"
+check "heredoc ) does not close \$(...)"     $'out="$(cat <<\'EOF\'\n)\nEOF\ngit stash pop\n)"' "$WT" DENY "linked worktree"
+check "commit heredoc holding 1) and it's"  $'git commit -m "$(cat <<\'EOF\'\n1) fix it\'s\nEOF\n)" && git stash pop' "$WT" DENY "linked worktree"
+check "commit heredoc, data only"           $'git commit -m "$(cat <<\'EOF\'\n1) never git stash pop\nEOF\n)"' "$WT" ALLOW
+check "arithmetic << is no heredoc"         'x=$((1<<2)); git stash pop'     "$WT" DENY "linked worktree"
+check "unquoted delimiter joins \\-newline"  $'cat <<EOF\nE\\\nOF\ngit stash pop\nEOF' "$WT" DENY "linked worktree"
+check "quoted delimiter does not join"      $'cat <<\'EOF\'\nE\\\nOF\ngit stash pop\nEOF' "$WT" ALLOW
+check "alias body keeps a quoted \$1"        "git -c 'alias.say=!printf \"%s\\n\" \"\$1\"' say ok" "$WT" ALLOW
+check "quoted \$1 alias is still judged"     "git -c 'alias.say=!git \"\$1\" pop' say stash" "$WT" DENY "linked worktree"
+check "continue carries its state"          "for i in 1 2; do git stash clear; cd $WT; if true; then continue; fi; cd $SOLO; done" "$SOLO" DENY "could not resolve"
+check "break leaves the loop's state"       "for i in 1; do cd $WT; break; cd $SOLO; done; git stash pop" "$SOLO" DENY "could not resolve"
+check "bash -c 'git \"\$@\"' runs its operands" "bash -c 'git \"\$@\"' _ stash list" "$WT" ALLOW
+check "bash -c 'git \"\$@\"', mutating"       "bash -c 'git \"\$@\"' _ stash pop" "$WT" DENY "linked worktree"
+check "reason says to stop on extra staged" "git stash"                       "$WT" DENY "lists only those paths"
 # Shims exec the real git through a path with a space, so an unquoted one breaks.
 sq() { printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"; }
 mkdir -p "$T/bin" "$T/real git" "$T/evil"; ln -s "$(command -v git)" "$T/real git/git"; REAL_GIT="$T/real git/git"

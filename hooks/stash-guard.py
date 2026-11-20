@@ -19,9 +19,11 @@ The target is resolved per segment: the hook's cwd (or inherited GIT_DIR),
 then any `cd` earlier in the chain (scoped to its `( )` / `$(...)` / backquote
 subshell, pipeline element or backgrounded list; unknown once an and-or list,
 `if` / loop / `case` branch or function body it may not have run in ends;
-`pushd -n` leaves it; a `cd` with a redirection that may fail (any but
-/dev/null or an fd dup) may not have run; each `case` arm starts from the
-state before the `case`, one after `;&` / `;;&` maybe from the last arm's;
+`pushd -n` leaves it; a `cd`, `export` or `unset` with a redirection that
+may fail (any but /dev/null or a dup / close of fd 0-2) may not have run;
+`continue` / `break` end a loop pass with their state; each `case` arm
+starts from the state before the `case`, one after `;&` / `;;&` maybe
+from the last arm's;
 `$PWD` / `$OLDPWD` follow it, and a child shell's `$PWD` names where it
 starts; `CDPATH=` / `HOME=` prefixes on the `cd` itself apply), then
 `env -C` / `sudo -D` (each relative to the last), then the invocation's own
@@ -29,12 +31,15 @@ starts; `CDPATH=` / `HOME=` prefixes on the `cd` itself apply), then
 `--work-tree` (left for git to resolve after every `-C`);
 VAR=val prefixes, `unset` and `env -u` / `-i` shape the GIT_* vars the probe
 sees (git's repo discovery vars included), a plain assignment reaches git or a
-child shell only once exported, and
+child shell only once exported, a `local` / `declare` value is uncertain
+(it may shadow the caller's only inside a function), and
 an export that may not have run leaves its var uncertain. Quote-, comment-,
 redirection- and heredoc-aware, so "git stash" inside an echo/grep/commit
 message or a data heredoc is not a stash (but a `$(...)` in an unquoted
-heredoc is), and `2>/dev/null git stash` is. `bash -c` / `sh -c` bodies
-(with their prefix assignments and `env -C`), a heredoc or here string fed to
+heredoc is; an unquoted delimiter matches after `\\`-newline joins, and a
+heredoc inside `$(...)` is data, its `)` too), and `2>/dev/null git stash`
+is. `bash -c` / `sh -c` bodies (with their prefix assignments and
+`env -C`), a heredoc or here string fed to
 a shell (in that command's context; `bash -s` operands fill its `$1` ...),
 `eval` bodies (in the caller's scope, so
 their cd/exports carry on), `$(...)` / backquotes (also inside double quotes,
@@ -46,7 +51,9 @@ are scanned too, and after a `git config` that may write an alias every later
 alias is denied as a possible stash (it may run anywhere); a body is judged
 both with the caller's $VARs expanded first and with the body expanding them
 itself, since quote removal hides which
-happens. `$VAR` command and subcommand words are expanded before matching.
+happens (unless every `$` in it was quoted). `$VAR` command and subcommand
+words are expanded before matching, and one that expands to git options
+(`git $opts stash`) is parsed as them.
 An arithmetic `$(( ))` is not a command: only the substitutions inside it
 (and its text, if it may spell a stash) are scanned.
 `env` / shells / `eval` / wrappers (`time -p`, `command -p`, `sudo -u X`,
@@ -55,11 +62,14 @@ by basename like git, their options consumed (the arguments xargs appends, or
 its `-I` strings, are unresolvable); `command -v` / `-V` runs nothing;
 `command` / `builtin` skip shell functions, and the program launchers skip
 functions and run `cd` / `export` / `eval` in a child, not this shell. A
-function call fills the body's `$1` / `"$@"` with its arguments. A `for` over
+function call fills the body's `$1` / `"$@"` with its arguments; a `{ }` or
+`( )` body is judged where it is defined too, since a `trap`, `xargs` or
+`"$f"` may call it unseen. A `for` over
 one word binds its variable (over several, it is uncertain). A loop's later
 passes are rescanned from its merged loop-carried state until that state
 settles. A `git worktree add` earlier in the command counts as another
-worktree for a later stash (in any repo: a false deny costs nothing).
+worktree for a later stash (in any repo, or at a path that does not exist
+yet: a false deny costs nothing).
 This guard stops ACCIDENTAL mutating stashes by agents; it is no sandbox
 against an adversary. Denying a mutating stash wrongly costs nothing (every
 brief bans `git stash` anyway), so a construct it cannot model is denied, not
@@ -81,8 +91,11 @@ an unresolvable command word naming a wrapper or shell (`"$SUDO" git stash`,
 arithmetic evaluation of a variable holding `a[$(...)]` is not seen; a
 `bash -s` heredoc or here string is judged as its script even when a later
 redirection or another fd number means the shell reads something else (a
-false deny only). A crash exits non-zero, which Claude Code treats as a
-non-blocking error (fail open), like the other Bash hooks here; a command
+false deny only); bash 3.2 (not 4+ or zsh) ends a `$(...)` at a `)` in its
+heredoc data, and that reading is not judged; an `env -S` `${VAR}` that an
+earlier `-u` / `-i` in that env removes is denied (GNU and BSD env differ).
+A crash exits non-zero, which Claude Code treats as a non-blocking error
+(fail open), like the other Bash hooks here; a command
 nested too deeply to parse is denied instead when it may spell a stash.
 """
 import json
@@ -100,7 +113,9 @@ PREFIX_WORDS = {"{", "}", "!", "then", "do", "else", "elif", "if", "while",
                 "until"}
 OPENERS = {"if", "while", "until", "for", "select", "case"}
 LOOPS = {"while", "until", "for", "select"}
-STATE_BUILTINS = {"cd", "pushd", "popd", "export", "unset", "return"}
+DECLARE = {"local", "declare", "typeset", "readonly"}
+STATE_BUILTINS = {"cd", "pushd", "popd", "export", "unset", "return",
+                  "continue", "break"} | DECLARE
 LOOP_PASSES = 8                           # loop-carried state converges well before this
 CLOSERS = {"fi", "done", "esac"}
 BLOCK_WORDS = OPENERS | CLOSERS | {"then", "do", "else", "elif", "{", "}", "!"}
@@ -173,7 +188,6 @@ ALIAS_WRITTEN = []                        # every such write: it lands on disk, 
 CASE_WORD = re.compile(r"(case|esac)(?![^\s;&|()<>])")
 CMD_POS = re.compile(r"(?:^|[;&|(\n])[ \t]*(?:(?:then|do|else|elif|if|while|until|[{!])[ \t]+)*$")
 ENV_S_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
-SAFE_REDIR = re.compile(r"/dev/null|-|\d+")    # a redirection operand that cannot fail
 CASE_HEAD = re.compile(r"\s*(?:(?:[{!]|then|do|else|elif|if|while|until)\s+)*case\s+"
                        r"(?:'[^']*'|\"(?:\\.|[^\"\\])*\"|\\.|[^\s'\"\\])+\s+in")
 # `git config` options that read, never write, and those taking a value
@@ -202,8 +216,10 @@ ALTERNATIVES = (
     "takes whatever is on top (routinely a parallel agent's WIP), and a stash "
     "on a clean tree saves nothing, so the pop after it is always someone "
     "else's entry. Safe alternatives: (1) a scratch commit on your "
-    "own branch: `git add <only the paths you may change>`, check "
-    "`git diff --cached --stat`, `git commit -m wip` and note its sha; later, "
+    "own branch: `git add <only the paths you may change>`, check that "
+    "`git diff --cached --stat` lists only those paths (if it lists anything "
+    "else, stop: do it in a separate worktree), `git commit -m wip` and note "
+    "its sha; later, "
     "only if `git rev-parse HEAD` on that same branch still prints that sha, "
     "`git reset --soft HEAD~1` (otherwise skip the reset); "
     "(2) run the base in its own checkout: `git worktree add --detach "
@@ -224,37 +240,46 @@ class TooDeep(Exception):
 
 class Lit(str):
     """A word in which a `$` was quoted or escaped, so the shell expanded
-    none of it there, while quote removal makes it look expandable."""
+    none of it there, while quote removal makes it look expandable. `full`:
+    every `$` in it was, so the shell expanded nothing in it."""
+    full = False
 
 
 def literal_dollar(raw):
-    """Whether raw word text holds a `$` inside single quotes or escaped."""
-    q, i = None, 0
+    """(whether raw word text holds a `$` inside single quotes or escaped,
+    whether every `$` in it is)."""
+    q, i, lit, live = None, 0, False, False
     while i < len(raw):
         c = raw[i]
         if q == "'":
             if c == "'":
                 q = None
             elif c == "$":
-                return True
+                lit = True
         elif c == "\\":
             if raw[i + 1:i + 2] == "$":
-                return True
+                lit = True
             i += 1
         elif c == '"':
             q = None if q else '"'
         elif c == "'" and not q:
             q = "'"
+        elif c == "$":
+            live = True
         i += 1
-    return False
+    return lit, lit and not live
 
 
 def close_paren(s, i):
     """Index of the `)` closing the `$(` whose body starts at `i` (quote-,
-    comment- and nesting-aware), or len(s) when it is never closed. The `)`
-    ending a `case` pattern (`case x in a) ...;; esac`) closes nothing."""
+    comment-, heredoc- and nesting-aware), or len(s) when it is never closed.
+    The `)` ending a `case` pattern (`case x in a) ...;; esac`) closes
+    nothing, nor does one in a heredoc's data (bash 4+ and zsh read a
+    heredoc inside `$(...)` before its `)`). A `$((` body is arithmetic,
+    where `<<` is a shift, not a heredoc."""
     depth, q, n, start, esc = 1, None, len(s), i, -1
     cases = []                            # the paren depth of each open `case`
+    docs, heredocs = [], s[i:i + 1] != "("  # heredocs pending at this line's end
     while i < n:
         c = s[i]
         if c == "\\" and q != "'":
@@ -271,6 +296,21 @@ def close_paren(s, i):
             if nl < 0:
                 return n
             i = nl
+            continue
+        elif c == "\n" and docs:
+            i += 1
+            for strip_tabs, delim, quoted in docs:
+                i = doc_end(s, i, strip_tabs, delim, quoted)[1]
+            docs = []
+            continue
+        elif heredocs and s.startswith("<<<", i):
+            i += 3                        # a here string
+            continue
+        elif heredocs and s.startswith("<<", i) and HEREDOC.match(s, i):
+            m = HEREDOC.match(s, i)
+            docs.append((m.group(1) == "-", heredoc_word(m.group(2)),
+                         any(ch in m.group(2) for ch in "'\"\\")))
+            i = m.end()
             continue
         elif c == "(":
             depth += 1
@@ -388,6 +428,26 @@ def heredoc_word(word):
         return re.sub(r"[\\'\"]", "", word)
 
 
+def doc_end(s, i, strip_tabs, delim, quoted):
+    """(body, index past its delimiter line) of a heredoc whose body starts
+    at `i`. An unquoted one joins a line ending in an unescaped backslash
+    with the next before matching the delimiter, as the shell does (`E\\`
+    then `OF` ends an `EOF` heredoc)."""
+    body, n = [], len(s)
+    while i < n:
+        end = s.find("\n", i)
+        line = s[i:] if end < 0 else s[i:end]
+        i = n if end < 0 else end + 1
+        while not quoted and i < n and (len(line) - len(line.rstrip("\\"))) % 2:
+            end = s.find("\n", i)
+            line = line[:-1] + (s[i:] if end < 0 else s[i:end])
+            i = n if end < 0 else end + 1
+        if (line.lstrip("\t") if strip_tabs else line) == delim:
+            break
+        body.append(line)
+    return "\n".join(body), i
+
+
 def words(seg):
     """(words, here strings, redirections) of a segment after quote removal.
     Redirections and their operands are dropped from the words wherever they
@@ -404,8 +464,10 @@ def words(seg):
             return
         text = "".join(raw)
         w = "".join(shlex.split(text, posix=True))
-        if "$" in w and literal_dollar(text):
+        lit, full = literal_dollar(text) if "$" in w else (False, False)
+        if lit:
             w = Lit(w)
+            w.full = full
         raw = []
         if pending is None:
             out.append(w)
@@ -491,15 +553,8 @@ def segments_at(s):
     def read_docs(i):                     # heredoc bodies follow this line
         nonlocal pending
         for strip_tabs, delim, quoted, owner in pending:
-            body = []
-            while i < n:
-                end = s.find("\n", i)
-                line = s[i:] if end < 0 else s[i:end]
-                i = n if end < 0 else end + 1
-                if (line.lstrip("\t") if strip_tabs else line) == delim:
-                    break
-                body.append(line)
-            owner.append(("\n".join(body), quoted))
+            body, i = doc_end(s, i, strip_tabs, delim, quoted)
+            owner.append((body, quoted))
         pending = []
         return i
 
@@ -719,6 +774,9 @@ def shared_reason(target, git_dir, work_tree, git_env):
     r = git(base + ["rev-parse", "--path-format=absolute",
                     "--git-dir", "--git-common-dir", "--show-toplevel"], git_env)
     if r is not None and r.returncode and NOT_A_REPO.search(r.stderr):
+        if WORKTREE_ADDED:                # `git worktree add X && git -C X stash`
+            return (f"a `git worktree add` earlier in this command may create "
+                    f"{target} as a worktree before the stash runs")
         return None                       # not a repo: the stash fails on its own
     lines = r.stdout.splitlines() if r is not None and not r.returncode else []
     if len(lines) < 2:
@@ -803,22 +861,29 @@ def split_string(val):
     return out
 
 
-def env_s_words(val, env, scoped):
+def env_s_words(val, env, entry, scoped):
     """The words `env -S val` runs: split_string()'s, each `${VAR}` replaced
-    by the value env itself holds (its environment so far), before env parses
-    them as its own options (`D=-C env -S '${D} /wt git stash'`). A word that
+    by the value env itself holds, before env parses them as its own options
+    (`D=-C env -S '${D} /wt git stash'`). GNU env reads it from the
+    environment env started with (`entry`), BSD env after the `-u` / `-i`
+    before it (`scoped`): when the two differ it is Unresolved. A word that
     expands to nothing is dropped. Raises Unresolved for a var it cannot know."""
     out = split_string(val)
     if not any(ENV_S_VAR.search(w) for w in out):
         return out
-    seen = exported_env(env, scoped)
 
-    def sub(m):
-        v = seen.get(m.group(1), "")
-        if v == UNCERTAIN:
-            raise Unresolved(f"env -S reads ${{{m.group(1)}}}, which may not be set")
-        return v
-    return [x for x in (ENV_S_VAR.sub(sub, w) for w in out) if x]
+    def reading(seen):
+        def sub(m):
+            v = seen.get(m.group(1), "")
+            if v == UNCERTAIN:
+                raise Unresolved(f"env -S reads ${{{m.group(1)}}}, which may not be set")
+            return v
+        return [x for x in (ENV_S_VAR.sub(sub, w) for w in out) if x]
+    gnu, bsd = reading(exported_env(env, entry)), reading(exported_env(env, scoped))
+    if gnu != bsd:
+        raise Unresolved("env -S reads a var an earlier -u / -i removes, and "
+                         "GNU and BSD env expand it differently")
+    return gnu
 
 
 def strip_prefix(toks, env):
@@ -885,6 +950,7 @@ def strip_prefix(toks, env):
                     else toks + [XARGS]   # `--git-dir={}` stays a --git-dir
         elif os.path.basename(t) == "env":
             toks, lookup = toks[1:], EXTERNAL
+            entry = dict(scoped)          # what env starts with, before its -u / -i
             while toks and toks[0].startswith("-"):
                 o, toks = toks[0], toks[1:]
                 if o == "--":
@@ -897,7 +963,7 @@ def strip_prefix(toks, env):
                         if not eq:
                             val, toks = (toks[0], toks[1:]) if toks else ("", toks)
                         if name == "--split-string":
-                            toks = env_s_words(val, env, scoped) + toks
+                            toks = env_s_words(val, env, entry, scoped) + toks
                         else:
                             env_opt("u" if name == "--unset" else "C", val)
                     continue
@@ -909,7 +975,7 @@ def strip_prefix(toks, env):
                         if not val:
                             val, toks = (toks[0], toks[1:]) if toks else ("", toks)
                         if o[k] == "S":           # -S 'git stash': its words lead the argv
-                            toks = env_s_words(val, env, scoped) + toks
+                            toks = env_s_words(val, env, entry, scoped) + toks
                         else:
                             env_opt(o[k], val)
                         break
@@ -986,6 +1052,15 @@ def merge(cwd, env, cwd2, env2):
         elif env.get(k) != env2.get(k):
             out[k] = UNCERTAIN
     return (cwd if cwd == cwd2 else None), out
+
+
+def may_fail(redirs):
+    """Whether a command's redirections may fail, so that the shell skips the
+    command: any but /dev/null, or a dup / close (`>&` / `<&`) of fd 0-2,
+    which a hook's shell always has open. `>1` is a file named 1, and
+    `2>&9` fails when fd 9 is closed."""
+    return any(w != "/dev/null" and not (op in (">&", "<&") and w in ("-", "0", "1", "2"))
+               for op, w in redirs)
 
 
 def shell_c_body(args):
@@ -1096,6 +1171,16 @@ def scan(cmd, cwd, env, depth, rets=None):
             if func is None and type(body) is Seg and body.split()[:1] == ["{"]:
                 func = (cwd, dict(env), lst, elem, cond, piped, blocks)
                 blocks, fname, fbody = [], seg.split()[-1], []
+            elif func is None and body == OPEN:   # `f() ( ... )`: a subshell body,
+                at = k = segs.index(OPEN, idx + 4)  # scanned here as one too
+                nest = 0
+                for k in range(at, len(segs)):
+                    nest += {OPEN: 1, CLOSE: -1}.get(segs[k], 0)
+                    if nest == 0:
+                        break
+                sub = tuple(segs[at:k + 1])
+                env[FUNC + seg.split()[-1]] = ((sub, " ".join(
+                    [*sub, *(d for b in sub for d, _ in getattr(b, "docs", ()))])),)
             continue
         if seg == OPEN:
             scopes.append((cwd, dict(env), lst, elem, cond, piped, blocks))
@@ -1167,7 +1252,8 @@ def scan(cmd, cwd, env, depth, rets=None):
                 continue
             if w in OPENERS:              # a branch or loop body may be skipped
                 blocks.append([cwd, dict(env), w in LOOPS and loop_start(segs, idx),
-                               w, None])  # ..., opener, merged ends of case arms
+                               w, None, []])  # ..., opener, merged ends of case arms,
+                                              # states at a `continue` / `break`
                 if w == "case":           # `case WORD in` runs no command
                     toks = []
             if w in ("for", "select") and toks and ASSIGN.match(toks[0] + "="):
@@ -1176,10 +1262,12 @@ def scan(cmd, cwd, env, depth, rets=None):
             elif w in ("else", "elif") and blocks:
                 cwd, env = merge(cwd, env, *blocks[-1][:2])
             elif w in CLOSERS and blocks:
-                c0, e0, start, _, arms = blocks.pop()
+                c0, e0, start, _, arms, jumps = blocks.pop()
                 cwd, env = merge(cwd, env, c0, e0)
                 if arms:                  # any arm that ran may be the one that ended it
                     cwd, env = merge(cwd, env, *arms)
+                for j in jumps:           # a pass, or the loop, may end at continue / break
+                    cwd, env = merge(cwd, env, *j)
                 if start is not False and (cwd, env) != (c0, e0):
                     reason, cwd, env = later_passes(segs[start:idx], cwd, env,
                                                     depth, rets)
@@ -1251,7 +1339,22 @@ def scan(cmd, cwd, env, depth, rets=None):
         if head == "return":              # the function's state may end here
             rets.append((cwd, dict(env)))
             continue
+        if head in ("continue", "break"):     # the loop's next pass / end starts here
+            for b in blocks:
+                if b[2] is not False:
+                    b[5].append((cwd, dict(env)))
+            continue
+        if head in DECLARE:               # `local` / `declare` may shadow a var for
+            for t in toks[1:]:            # a function call only: its value is uncertain
+                k = t.partition("=")[0]
+                if t.startswith(("-", "+")) or not ASSIGN.match(k + "="):
+                    continue
+                if k not in env:
+                    env[LOCAL + k] = UNCERTAIN  # it may be exported (`-x`) or not
+                env[k] = UNCERTAIN
+            continue
         if head in ("export", "unset"):
+            old_env = dict(env)
             opts = "".join(t[1:] for t in toks[1:] if t.startswith("-"))
             for t in toks[1:]:
                 k, eq, v = t.partition("=")
@@ -1277,6 +1380,8 @@ def scan(cmd, cwd, env, depth, rets=None):
                     env.pop(LOCAL + k, None)
                     if k not in env:      # the export outlives the unset value
                         env[EXPORT + k] = "1"
+            if may_fail(redirs):          # a failed redirection skips it
+                cwd, env = merge(cwd, old_env, cwd, env)
             continue
         if head in ("cd", "pushd", "popd"):
             if head == "pushd" and any(re.fullmatch(r"-[A-Za-z]*n[A-Za-z]*", a)
@@ -1304,7 +1409,7 @@ def scan(cmd, cwd, env, depth, rets=None):
             else:                         # bash keeps $PWD / $OLDPWD in step
                 env["PWD"], env["OLDPWD"] = cwd, (UNCERTAIN if old is None
                                                   else old)
-            if any(not SAFE_REDIR.fullmatch(w) for _, w in redirs):
+            if may_fail(redirs):
                 cwd, env = merge(old, old_env, cwd, env)  # a failed redirection skips the cd
             continue
         run_cwd = cwd
@@ -1332,9 +1437,10 @@ def scan(cmd, cwd, env, depth, rets=None):
             if raw:
                 scripts = variants(raw, env)  # `eval "$CMD"` runs what $CMD holds
                 if pos:                   # `bash -c '"$@"' _ git stash`: the body runs its args
-                    args = [substitute(a, env) for a in pos]
-                    scripts = list(dict.fromkeys([forward(b, args)
-                                                  for b in scripts] + scripts))
+                    args = [substitute(a, env) for a in pos]  # (and, unless every `$` in
+                    scripts = list(dict.fromkeys(             # it was quoted, maybe the
+                        [forward(b, args) for b in scripts] +  # caller's own, unknown)
+                        ([] if getattr(raw, "full", False) else scripts)))
             elif name == "eval" or not from_stdin:
                 continue                  # `bash script.sh <<< x`: x is the script's data
             else:                         # `bash <<EOF` / `bash <<< ...`: stdin is the script
@@ -1381,6 +1487,9 @@ def scan(cmd, cwd, env, depth, rets=None):
             env[ALIAS_WRITE] = "1"        # a loop's next pass must see it
     if scopes:                            # an unclosed ( ends with the command
         cwd, env = scopes[0][:2]
+    for b in blocks:                      # a loop body rescanned by later_passes():
+        for j in b[5]:                    # its pass may end at a `continue`
+            cwd, env = merge(cwd, env, *j)
     return None, cwd, env
 
 
@@ -1518,7 +1627,8 @@ def blocked(label, why):
             f"by default. " + ALTERNATIVES)
 
 
-def judge_git(args, cwd, env, scoped=None, depth=0, opaque_cmd=False):
+def judge_git(args, cwd, env, scoped=None, depth=0, opaque_cmd=False,
+              split=False):
     """Deny reason for one git invocation's argv (after `git`), or None.
     `env` expands the argv (the shell expands words before a command-scoped
     VAR=val takes effect); `scoped` only reaches git's own environment.
@@ -1528,7 +1638,11 @@ def judge_git(args, cwd, env, scoped=None, depth=0, opaque_cmd=False):
     so when the repo is unknown and nothing on the line or in the env can
     define an alias (`-c alias.<word>` / `include.*`, an unresolvable `-c`,
     GIT_CONFIG_* vars), no alias lookup is attempted: failing closed there
-    would deny every `$VAR args` after an uncertain cd."""
+    would deny every `$VAR args` after an uncertain cd. A word whose
+    expansion leads with an option (`opts='-C /wt'; git $opts stash`) is
+    reparsed as the options it splits into (`split` marks that pass), which
+    a quoted `"$opts"` would not be: git then rejects the option, so judging
+    it split only ever denies more."""
     scoped = scoped or {}
     target, git_dir, work_tree, configs, i = cwd, None, None, [], 0
     pending_unresolved = config_unresolved = None
@@ -1553,8 +1667,9 @@ def judge_git(args, cwd, env, scoped=None, depth=0, opaque_cmd=False):
             elif name == "--work-tree" and value:
                 work_tree = path_word(value, env)
             elif name == "-c" and value:
-                try:
-                    configs.append(expand(value, env))
+                try:                      # all its `$`s quoted: the shell expanded none
+                    configs.append(str(value) if getattr(value, "full", False)
+                                   else expand(value, env))
                 except Unresolved as e:
                     config_unresolved = str(e)
             elif name == "--config-env" and value:
@@ -1573,6 +1688,11 @@ def judge_git(args, cwd, env, scoped=None, depth=0, opaque_cmd=False):
         rest, opaque = ["stash"] + args[i + 1:], str(e)
     if not rest:
         return None
+    if rest[0].startswith("-") and rest[0] != args[i]:
+        if split:                         # it expands to yet another option word
+            return blocked(f"`git {args[i]}`", "its options come from an "
+                           "expansion that expands to more options")
+        return judge_git(args[:i] + rest, cwd, env, scoped, depth, opaque_cmd, True)
     if rest[0] == "config" and config_may_alias(rest[1:]):
         ALIAS_WRITTEN.append(rest)        # later alias lookups cannot trust the config
     try:
