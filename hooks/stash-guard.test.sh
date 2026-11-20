@@ -242,6 +242,8 @@ check "env A=b sets no shell state"          "env PWD=$SOLO; git -C \"\$PWD\" st
 check "command cd is the builtin"            "cd() { :; }; command cd $SOLO; git stash pop" "$WT" ALLOW
 check "function forwards \"\$@\""            "f() { \"\$@\"; }; f git stash pop" "$WT" DENY "linked worktree"
 check "function forwards \$1 into git"       "f() { git \"\$1\" clear; }; f stash" "$WT" DENY "linked worktree"
+check "function forwards \$1 as the command" "f() { \$1 clear; }; f 'git stash'" "$WT" DENY "linked worktree"
+check "the \$1 body alone runs no stash"     "f() { \$1 clear; }"              "$WT" ALLOW
 check "function forwards a read-only stash"  "f() { \"\$@\"; }; f git stash list" "$WT" ALLOW
 check "function echoes forwarded args"       "f() { echo \"\$@\"; }; f git stash pop" "$WT" ALLOW
 check "function without cd, solo repo"      "f() { echo hi; }; git stash clear" "$SOLO" ALLOW
@@ -347,25 +349,125 @@ check "here string to a script is data"     "bash read-line.sh <<< 'git stash po
 check "here string to bash -s is the script" "bash -s <<< 'git stash pop'"    "$WT" DENY "linked worktree"
 check "heredoc to a script is data"         $'bash read.sh <<EOF\ngit stash pop\nEOF' "$WT" ALLOW
 
-mkdir -p "$T/bin"; REAL_GIT=$(command -v git)
-printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> %s\nexec %s "$@"\n' "$T/argv.log" "$REAL_GIT" > "$T/bin/git"; chmod +x "$T/bin/git"
+# --- case arms, child-shell $PWD, subsection / shell aliases, xargs input,
+#     command -v and alias writes
+check "case arm cd stays in its arm"        "case x in a) cd $SOLO;; *) git stash clear;; esac" "$WT" DENY "linked worktree"
+check "multi-line case arm cd stays"        $'case x in\n  a) cd '"$SOLO"$';;\n  # note\n  *) git stash clear;;\nesac' "$WT" DENY "linked worktree"
+check "next case arm starts afresh"         "case x in a) cd $WT;; *) git stash pop;; esac" "$SOLO" ALLOW
+check "case arm cd is uncertain after esac" "case x in a) cd $SOLO;; esac; git stash clear" "$WT" DENY "could not resolve"
+check "case ;& arm may fall through"        "case x in a) cd $SOLO;& b) git stash clear;; esac" "$WT" DENY "could not resolve"
+check "case extglob pattern parens"         "case x in @(a|b)) cd $SOLO;; *) git stash clear;; esac" "$WT" DENY "linked worktree"
+check "case pattern ) is no subshell close" "(case x in x) ;; esac; cd $SOLO); git stash clear" "$WT" DENY "linked worktree"
+check "case (pattern) is no subshell open"  "(case x in (a) cd $SOLO;; esac; git stash clear)" "$WT" DENY "could not resolve"
+check "case a|b pattern is no pipe"         "case x in a|b) git stash pop;; esac" "$WT" DENY "linked worktree"
+check "case arm heredoc stays data"         $'case x in\n a) cat <<EOF;;\ngit stash pop\nEOF\nesac\ngit status' "$WT" ALLOW
+check "case arm heredoc fed to bash"        $'case x in\n a) bash <<EOF;;\ngit stash pop\nEOF\nesac' "$WT" DENY "linked worktree"
+check "nested case arm cd stays"            "case x in a) case y in b) cd $SOLO;; esac;; *) git stash clear;; esac" "$WT" DENY "linked worktree"
+check "read-only stash in a case arm"       "case \$X in a) git stash list;; esac" "$WT" ALLOW
+check "env -C child shell \$PWD"            "env -C $WT bash -c 'git -C \"\$PWD\" stash clear'" "$SOLO" DENY "linked worktree"
+check "env -C child sh cd \$PWD"            "env -C $WT sh -c 'cd \"\$PWD\" && git stash pop'" "$SOLO" DENY "linked worktree"
+check "child shell keeps its own \$PWD"     "bash -c 'git -C \"\$PWD\" stash clear'" "$SOLO" ALLOW
+check "env -C unknown dir, child \$PWD"     "env -C \"\$NOPE_UNSET\" bash -c 'git -C \"\$PWD\" stash pop'" "$SOLO" DENY "could not resolve"
+g -C "$MAIN" config alias.pw '!git -C "$PWD" stash clear'
+check "shell alias \$PWD is its top level"  "git -C $WT pw"                   "$SOLO" DENY "linked worktree"
+check "-c subsection alias runs a stash"    "git -c 'alias.sv.command=stash clear' sv" "$WT" DENY "linked worktree"
+g -C "$MAIN" config alias.shelf3.command 'stash pop'
+check "configured subsection alias"         "git shelf3"                      "$WT" DENY "linked worktree"
+check "subsection alias, read-only"         "git -c alias.sl.command='stash list' sl" "$WT" ALLOW
+check "later plain alias wins"              "git -c alias.zz.command='stash clear' -c alias.zz=status zz" "$WT" ALLOW
+check "later subsection alias wins"         "git -c alias.zz=status -c alias.zz.command='stash clear' zz" "$WT" DENY "linked worktree"
+check "subsection name is case-sensitive"   "git -c alias.ZQ.command='stash clear' zq" "$WT" ALLOW
+check "subsection name with a space"        "git -c 'alias.a b.command=stash clear' 'a b'" "$WT" DENY "linked worktree"
+check "unresolved command word, -c subsection" "cd $T/nope; \"\$NOPE_UNSET_VAR\" -c alias.p.command='stash pop' p" "$WT" DENY "could not be resolved"
+g -C "$MAIN" config alias.bx '!bash -c "$1"'
+check "shell alias binds \$1"               "git bx 'git stash clear'"        "$WT" DENY "linked worktree"
+check "shell alias \$1, read-only"          "git bx 'git stash list'"         "$WT" ALLOW
+check "xargs input is git's subcommand"     "echo stash clear | xargs git"   "$WT" DENY "<xargs input>"
+check "xargs -I word is unresolved"         "echo stash | xargs -I{} git {} clear" "$WT" DENY "could not be resolved"
+check "xargs -I -C target is unresolved"    "echo d | xargs -I{} git -C {} stash clear" "$WT" DENY "could not resolve"
+check "xargs -I -C, real command"           "echo d | xargs -I{} git -C {} status" "$WT" ALLOW
+check "xargs into git add"                  "ls | xargs git add"              "$WT" ALLOW
+check "xargs into a read-only stash"        "echo x | xargs git stash list"   "$WT" ALLOW
+check "xargs input, solo repo"              "echo clear | xargs git stash"    "$SOLO" ALLOW
+check "xargs fills a later \$N"             "echo a b stash | xargs sh -c 'git \$3 clear' _" "$WT" DENY "linked worktree"
+check "xargs --config-env value"            "echo k | xargs -I@ git --config-env @ x" "$WT" DENY "could not resolve"
+check "command -v cd runs no cd"            "command -v cd $SOLO; git stash clear" "$WT" DENY "linked worktree"
+check "command -pv cd runs no cd"           "command -pv cd $SOLO; git stash clear" "$WT" DENY "linked worktree"
+check "command -v git stash is a lookup"    "command -v git stash pop"        "$WT" ALLOW
+check "command -V git stash is a lookup"    "command -V git stash"            "$WT" ALLOW
+check "alias written earlier in the command" "git config alias.zap 'stash clear'; git zap" "$WT" DENY "earlier in this command"
+check "alias written by a child shell"      "bash -c \"git config alias.zap 'stash clear'\"; git zap" "$WT" DENY "earlier in this command"
+check "alias written by git config set"     "git config set alias.zap 'stash clear' && git zap" "$WT" DENY "earlier in this command"
+check "include written earlier"             "git config -f .git/config include.path /x; git zap" "$WT" DENY "earlier in this command"
+check "alias written in a loop's pass"      "for i in 1 2; do git zap; git config alias.zap 'stash clear'; done" "$WT" DENY "earlier in this command"
+check "alias written, solo repo"            "git config alias.zap 'stash clear'; git zap" "$SOLO" DENY "earlier in this command"
+check "alias read is no write"              "git config --get alias.zap; git config alias.zap; git zap" "$WT" ALLOW
+check "non-alias config write"              "git config user.name x; git zap" "$WT" ALLOW
+check "alias write, then a builtin"         "git config alias.co checkout; git status" "$WT" ALLOW
+
+# --- CodeRabbit round 8: each construct below is denied (fail closed) or
+#     modelled exactly; a false deny of a mutating stash costs nothing
+check "case arm inside quoted \$(...)"       "x=\"\$(case a in a) git stash pop;; esac)\"" "$WT" DENY "linked worktree"
+check "case arm inside \$(...), read-only"   "x=\"\$(case a in a) git stash list;; esac)\"" "$WT" ALLOW
+check "case word in \$(...) is no case"      "x=\"\$(echo case in x)\"; git status" "$WT" ALLOW
+deep=$(python3 -c 'print("echo $(" * 1000 + "git stash pop" + ")" * 1000)')
+check "deep \$(...) nesting fails closed"    "$deep"                           "$WT" DENY "nested too deeply"
+deep=$(python3 -c 'print("echo $(" * 1000 + "echo hi" + ")" * 1000)')
+check "deep \$(...) nesting, no stash"       "$deep"                           "$WT" ALLOW
+mkdir -p "$T/pool"; ln -s "$WT" "$T/pool/solo"
+check "CDPATH= prefix on cd applies"        "CDPATH=$T/pool cd solo; git stash pop" "$T" DENY "linked worktree"
+check "CDPATH= on another command is gone"  "CDPATH=$T/pool true; cd solo; git stash pop" "$T" ALLOW
+check "HOME= prefix on a bare cd applies"   "HOME=$WT cd; git stash pop"      "$SOLO" DENY "linked worktree"
+check "written ! alias may run elsewhere"   "git config alias.zap '!git -C $WT stash clear'; git zap" "$SOLO" DENY "earlier in this command"
+check "env -S \${VAR} becomes an env option" "D=-C env -S '\${D} $WT git stash pop'" "$SOLO" DENY "linked worktree"
+check "env -S uncertain \${VAR}"             "if true; then export D=-C; fi; env -S '\${D} $WT git stash pop'" "$SOLO" DENY "could not resolve"
+check "env -S \${VAR}, solo repo"            "D=-C env -S '\${D} $SOLO git stash pop'" "$WT" ALLOW
+check "xargs -I keeps --git-dir="           "echo x | xargs -I{} git --git-dir={} stash clear" "$SOLO" DENY "could not resolve"
+check "bash -s operands fill \"\$@\""         $'bash -s git stash pop <<\'EOF\'\n"$@"\nEOF' "$WT" DENY "linked worktree"
+check "bash -s operands, read-only"         $'bash -s git stash list <<\'EOF\'\n"$@"\nEOF' "$WT" ALLOW
+ln -s "$WT" "$T/\$DEST"
+check "single-quoted \$ in -C is literal"    "DEST=$SOLO; git -C '\$DEST' stash pop" "$T" DENY "quoted"
+check "double-quoted \$ in -C expands"       "DEST=$SOLO; git -C \"\$DEST\" stash pop" "$T" ALLOW
+check "cd with a failing redirection"       "cd $SOLO > $T/missing/log; git stash pop" "$WT" DENY "could not resolve"
+check "cd >/dev/null still lands"           "cd $SOLO >/dev/null && git stash pop" "$WT" ALLOW
+check "reason says to verify HEAD first"    "git stash"                       "$WT" DENY "still prints that sha"
+check "uncertain discovery var fails closed" "if true; then export GIT_DISCOVERY_ACROSS_FILESYSTEM=1; fi; git stash pop" "$SOLO" DENY "may not have run"
+# Shims exec the real git through a path with a space, so an unquoted one breaks.
+sq() { printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"; }
+mkdir -p "$T/bin" "$T/real git" "$T/evil"; ln -s "$(command -v git)" "$T/real git/git"; REAL_GIT="$T/real git/git"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> %s\nexec %s "$@"\n' "$(sq "$T/argv.log")" "$(sq "$REAL_GIT")" > "$T/bin/git"; chmod +x "$T/bin/git"
 PATH="$T/bin:$PATH" \
 check "--config-env value stays off argv"   "TOK=s3cr3t-token git --config-env=http.extraHeader=TOK zz" "$WT" ALLOW
 if grep -q s3cr3t-token "$T/argv.log"; then fail=$((fail+1)); echo "FAIL: --config-env value reached a probe argv"; else pass=$((pass+1)); echo "ok   PRIV   --config-env value kept off probe argv"; fi
-grep -q 'config-env=http.extraHeader=TOK' "$T/argv.log" && { pass=$((pass+1)); echo "ok   PRIV   --config-env passed by name"; } || { fail=$((fail+1)); echo "FAIL: --config-env not passed to the probe by name"; }
+grep -q 'config-env=http.extraHeader=STASH_GUARD_CONFIG_0' "$T/argv.log" && { pass=$((pass+1)); echo "ok   PRIV   --config-env passed by a name of the hook's"; } || { fail=$((fail+1)); echo "FAIL: --config-env not passed to the probe by the hook's name"; }
 PATH="$T/bin:$PATH" \
 check "--config-env alias via env, still judged" "A='stash clear' git --config-env=alias.s=A s" "$WT" DENY "linked worktree"
-printf '#!/bin/sh\nfor a; do [ "$a" = worktree ] && exit 1; done\nexec %s "$@"\n' "$REAL_GIT" > "$T/bin/git"; chmod +x "$T/bin/git"
+printf '#!/bin/sh\n: > %s\nexit 1\n' "$(sq "$T/evil.ran")" > "$T/evil/git"; chmod +x "$T/evil/git"
+check "--config-env=k=PATH picks no probe git" "PATH=$T/evil git --config-env=x.y=PATH zz" "$WT" ALLOW
+if [ -e "$T/evil.ran" ]; then fail=$((fail+1)); echo "FAIL: a request's PATH chose the probe's git"; else pass=$((pass+1)); echo "ok   PRIV   a request's PATH never picks the probe's git"; fi
+printf '#!/bin/sh\necho "D=$GIT_DISCOVERY_ACROSS_FILESYSTEM" >> %s\nexec %s "$@"\n' "$(sq "$T/disc.log")" "$(sq "$REAL_GIT")" > "$T/bin/git"
+PATH="$T/bin:$PATH" \
+check "discovery var with a solo repo"      "GIT_DISCOVERY_ACROSS_FILESYSTEM=1 git stash pop" "$SOLO" ALLOW
+grep -q '^D=1$' "$T/disc.log" && { pass=$((pass+1)); echo "ok   ENV    the probe discovers the repo as git would"; } || { fail=$((fail+1)); echo "FAIL: GIT_DISCOVERY_ACROSS_FILESYSTEM did not reach the probe"; }
+printf '#!/bin/sh\nfor a; do [ "$a" = worktree ] && exit 1; done\nexec %s "$@"\n' "$(sq "$REAL_GIT")" > "$T/bin/git"
 PATH="$T/bin:$PATH" \
 check "failed worktree probe fails closed"  "git stash"                       "$MAIN" DENY "could not list"
 
-printf '#!/bin/sh\nfor a; do [ "$a" = rev-parse ] && exit 1; done\nexec %s "$@"\n' "$REAL_GIT" > "$T/bin/git"
+printf '#!/bin/sh\nfor a; do [ "$a" = rev-parse ] && exit 1; done\nexec %s "$@"\n' "$(sq "$REAL_GIT")" > "$T/bin/git"
 PATH="$T/bin:$PATH" \
 check "failed repo probe fails closed"      "git stash"                       "$SOLO" DENY "could not probe"
 
-printf '#!/bin/sh\nsleep 0.6\nexec %s "$@"\n' "$REAL_GIT" > "$T/bin/git"
+# The deny must come from the second probe running out of the shared budget:
+# both probes start, and the hook waits out the budget, so an immediate
+# lookup failure (whose reason also says "failed or timed out") cannot pass.
+printf '#!/bin/sh\necho x >> %s\nsleep 0.6\nexec %s "$@"\n' "$(sq "$T/deadline.log")" "$(sq "$REAL_GIT")" > "$T/bin/git"
+t0=$(python3 -c 'import time; print(time.time())')
 PATH="$T/bin:$PATH" STASH_GUARD_BUDGET=1 \
 check "probes share one deadline"           "git -c alias.a=b -c 'alias.b=stash pop' a" "$SOLO" DENY "timed out"
+probes=$(wc -l < "$T/deadline.log" | tr -d ' ')
+if [ "$probes" = 2 ] && python3 -c 'import sys, time; sys.exit(time.time() - float(sys.argv[1]) < 0.9)' "$t0"; then
+  pass=$((pass+1)); echo "ok   TIME   the deadline, not a lookup error, denied it"
+else fail=$((fail+1)); echo "FAIL: probes share one deadline: $probes probe(s), not the 2 a timeout takes"; fi
 
 # --- the main checkout is guarded too while other worktrees exist
 check "main tree with a linked wt attached" "git stash"                       "$MAIN" DENY "other worktree"
