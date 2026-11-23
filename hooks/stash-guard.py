@@ -179,6 +179,7 @@ UNCERTAIN = "\0?"                         # env value: a step that may not have 
 LOCAL = "\0l"                             # env key prefix: that var is set but not exported
 EXPORT = "\0x"                            # env key prefix: that var is exported but not set
 ALLEXPORT = "\0A"                        # env key: `set -a` is on, so assignments export
+PHYSICAL = "\0P"                         # env key: `set -P` is on, so cd resolves physically
 MAX_DEPTH = 3                             # nested shell/eval bodies scanned
 MAX_NEST = 50                             # nested $(...) / backquotes parsed (no agent nests
                                           # near this; past it the parse would recurse unbounded)
@@ -217,6 +218,16 @@ GIT = shutil.which("git")                 # the hook's own git: never one a requ
 # Set once a `git worktree add` is seen earlier in the request: the probe ran
 # before it, so a checkout it lists as solo may have a worktree by the stash.
 WORKTREE_ADDED = []
+# Where each earlier `git worktree move` may put its worktree (None: unknown).
+# A path that is not a repo at probe time may be that worktree by the stash.
+WORKTREE_MOVED = []
+
+
+def side_effects():
+    """Counts of the request-wide writes a loop pass can make that its shell
+    state does not show: worktree adds / moves and alias writes, which land
+    on disk even from a subshell, so the next pass sees them."""
+    return len(WORKTREE_ADDED), len(WORKTREE_MOVED), len(ALIAS_WRITTEN)
 
 ALTERNATIVES = (
     "refs/stash is ONE stack shared by every worktree of this repo, so a pop "
@@ -809,6 +820,10 @@ def shared_reason(target, git_dir, work_tree, git_env):
     r = git(base + ["rev-parse", "--path-format=absolute",
                     "--git-dir", "--git-common-dir", "--show-toplevel"], git_env)
     if r is not None and r.returncode and NOT_A_REPO.search(r.stderr):
+        if any(d is None or target == d or target.startswith(d.rstrip("/") + "/")
+               for d in WORKTREE_MOVED):  # `git worktree move A B && git -C B stash`
+            return (f"a `git worktree move` earlier in this command may move a "
+                    f"worktree to {target} before the stash runs")
         if WORKTREE_ADDED:                # `git worktree add X && git -C X stash`
             return (f"a `git worktree add` earlier in this command may create "
                     f"{target} as a worktree before the stash runs")
@@ -1046,7 +1061,7 @@ def exported_env(env, scoped):
     A command-scoped VAR=val always reaches the child; a var whose export may
     not have run is UNCERTAIN."""
     out = {k: v for k, v in with_scoped(env, scoped).items()
-           if not k.startswith((FUNC, EXPORT)) and k != ALLEXPORT}
+           if not k.startswith((FUNC, EXPORT)) and k not in (ALLEXPORT, PHYSICAL)}
     for k in [k for k in out if k.startswith(LOCAL)]:
         name, flag = k[len(LOCAL):], out.pop(k)
         if name in scoped or name not in out:
@@ -1231,7 +1246,8 @@ def scan(cmd, cwd, env, depth, rets=None):
                         break
                 sub = tuple(segs[at:k + 1])
                 env[FUNC + seg.split()[-1]] = ((sub, " ".join(
-                    [*sub, *(d for b in sub for d, _ in getattr(b, "docs", ()))])),)
+                    [*sub, *(d for b in sub for d, _ in getattr(b, "docs", ()))]),
+                    False),)
             continue
         if seg == OPEN:
             scopes.append((cwd, dict(env), lst, elem, cond, piped, blocks))
@@ -1297,33 +1313,47 @@ def scan(cmd, cwd, env, depth, rets=None):
                 fdepth += 1 if w == "{" else -1
                 if fdepth == 0:           # the body ends: it runs only where f is called
                     cwd, env, lst, elem, cond, piped, blocks = func
-                    env[FUNC + fname] = ((tuple(fbody), " ".join(
-                        [*fbody, *(d for b in fbody for d, _ in getattr(b, "docs", ()))])),)
+                    env[FUNC + fname] = ((tuple(fbody), " ".join(   # `} > f`: each call
+                        [*fbody, *(d for b in fbody for d, _ in getattr(b, "docs", ()))]),
+                        may_fail(redirs)),)  # applies it, and a failed one skips the body
                     func = None
                 continue
             if w in OPENERS:              # a branch or loop body may be skipped
                 blocks.append([cwd, dict(env), w in LOOPS and loop_start(segs, idx),
-                               w, None, [], len(WORKTREE_ADDED)])
-                # ..., opener, merged ends of case arms, states at a `continue` /
-                # `break`, and the `git worktree add`s seen before it opened
+                               w, None, [], side_effects(), None, False])
+                # ..., opener, merged ends of case / if arms, states at a
+                # `continue` / `break`, the side_effects() before it opened,
+                # the state after an if's latest condition, and whether it has
+                # an `else` (then some arm always runs)
                 if w == "case":           # `case WORD in` runs no command
                     toks = []
             if w in ("for", "select") and toks and ASSIGN.match(toks[0] + "="):
                 bind_loop_var(toks, env, w == "for")
                 toks = []                 # the body follows in later segments
+            elif w == "then" and blocks and blocks[-1][3] == "if":
+                blocks[-1][7] = (cwd, dict(env))  # an arm, or the next test, starts here
+            elif w in ("else", "elif") and blocks and blocks[-1][7] is not None:
+                b = blocks[-1]            # the arm just scanned is one possible exit
+                b[4] = (cwd, dict(env)) if b[4] is None else merge(*b[4], cwd, env)
+                b[8] = w == "else"
+                cwd, env = b[7][0], dict(b[7][1])
+                lst = elem = (cwd, dict(env))
             elif w in ("else", "elif") and blocks:
                 cwd, env = merge(cwd, env, *blocks[-1][:2])
             elif w in CLOSERS and blocks:
-                c0, e0, start, _, arms, jumps, added = blocks.pop()
-                cwd, env = merge(cwd, env, c0, e0)
+                c0, e0, start, opener, arms, jumps, added, test, final = blocks.pop()
+                if opener != "if" or test is None:
+                    cwd, env = merge(cwd, env, c0, e0)
+                elif not final:           # no arm runs when every test fails
+                    cwd, env = merge(cwd, env, *test)
                 if arms:                  # any arm that ran may be the one that ended it
                     cwd, env = merge(cwd, env, *arms)
                 for j in jumps:           # a pass, or the loop, may end at continue / break
                     cwd, env = merge(cwd, env, *j)
-                # A pass that adds a worktree changes the next pass too: its
-                # stash may then run beside the new worktree.
+                # A pass that adds or moves a worktree, or writes an alias (even
+                # in a subshell), changes the next pass too.
                 if start is not False and ((cwd, env) != (c0, e0) or
-                                           len(WORKTREE_ADDED) != added):
+                                           side_effects() != added):
                     reason, cwd, env = later_passes(segs[start:idx], cwd, env,
                                                     depth, rets)
                     if reason:
@@ -1371,7 +1401,7 @@ def scan(cmd, cwd, env, depth, rets=None):
             defs = [b for b in bodies if b is not None]
             args = ["$0", *(substitute(a, env) for a in toks[1:])]
             scripts, texts = [], []
-            for b, t in defs:             # `f() { "$@"; }; f git stash`: its args fill $@
+            for b, t, _ in defs:          # `f() { "$@"; }; f git stash`: its args fill $@
                 fwd = [forward_seg(x, args) for x in b]
                 same = all(x == y and getattr(x, "docs", ()) == getattr(y, "docs", ())
                            for x, y in zip(fwd, b))
@@ -1387,8 +1417,8 @@ def scan(cmd, cwd, env, depth, rets=None):
                     return reason, cwd, env
                 e2.setdefault(FUNC + head, bodies)
                 c, e = merge(c, e, c2, e2)
-            if may_fail(redirs):          # a failed redirection skips the call
-                c, e = merge(cwd, env, c, e)
+            if may_fail(redirs) or any(f for _, _, f in defs):
+                c, e = merge(cwd, env, c, e)  # a failed redirection skips the call
             cwd, env = c, e
             continue
         if head == "return":              # the function's state may end here
@@ -1409,27 +1439,33 @@ def scan(cmd, cwd, env, depth, rets=None):
                 env[k] = UNCERTAIN
             continue
         if head == "set":                 # `set -a` / `-o allexport`: later
-            old_env, on, k = dict(env), None, 1   # assignments are exported
+            old_env, k = dict(env), 1     # assignments are exported; `set -P` /
+            on = {ALLEXPORT: None, PHYSICAL: None}  # `-o physical`: cd is physical
             while k < len(toks):
                 t = toks[k]
                 if "$" in t or "`" in t or XARGS in t:
-                    on = UNCERTAIN        # `set $OPTS`: it may be -a
+                    on = dict.fromkeys(on, UNCERTAIN)  # `set $OPTS`: it may be -a
                     break
                 if t in ("-", "--") or len(t) < 2 or t[0] not in "-+":
                     break                 # the positional parameters follow
                 if "a" in t[1:]:
-                    on = t[0] == "-"
+                    on[ALLEXPORT] = t[0] == "-"
+                if "P" in t[1:]:
+                    on[PHYSICAL] = t[0] == "-"
                 if "o" in t[1:]:          # -o / -eo NAME: the name follows
                     k += 1
-                    if toks[k:k + 1] == ["allexport"]:
-                        on = t[0] == "-"
+                    key = {"allexport": ALLEXPORT, "physical": PHYSICAL}.get(
+                        toks[k] if k < len(toks) else None)
+                    if key:
+                        on[key] = t[0] == "-"
                 k += 1
-            if on is True:
-                env[ALLEXPORT] = "1"
-            elif on is False:
-                env.pop(ALLEXPORT, None)
-            elif on == UNCERTAIN:
-                env[ALLEXPORT] = UNCERTAIN
+            for key, v in on.items():
+                if v is True:
+                    env[key] = "1"
+                elif v is False:
+                    env.pop(key, None)
+                elif v == UNCERTAIN:
+                    env[key] = UNCERTAIN
             if may_fail(redirs):          # a failed redirection skips it
                 cwd, env = merge(cwd, old_env, cwd, env)
             continue
@@ -1448,9 +1484,9 @@ def scan(cmd, cwd, env, depth, rets=None):
                         env.pop(LOCAL + k, None)
                         env.pop(EXPORT + k, None)
                     continue
-                if eq:
+                if eq:                    # bash expands every operand first
                     try:
-                        env[k] = expand(v, env)
+                        env[k] = expand(v, old_env)
                     except Unresolved:
                         env[k] = UNCERTAIN
                 if "n" in opts:           # export -n: set, but no longer exported
@@ -1468,8 +1504,11 @@ def scan(cmd, cwd, env, depth, rets=None):
                                        for a in toks[1:]):
                 continue                  # pushd -n: only the dir stack changes
             args = [a for a in toks[1:] if a == "-" or not a.startswith("-")]
-            physical = any(a.startswith("-") and "P" in a for a in toks[1:]
-                           if a not in args)
+            physical = {"1": True, UNCERTAIN: None}.get(env.get(PHYSICAL), False)
+            for a in toks[1:]:            # `set -P`, unless a later -L / -P overrides it
+                if a.startswith("-") and a not in args:
+                    for ch in a[1:]:
+                        physical = {"P": True, "L": False}.get(ch, physical)
             old, old_env = cwd, dict(env)
             try:
                 if head == "popd" or args[:1] == ["-"] or \
@@ -1481,8 +1520,13 @@ def scan(cmd, cwd, env, depth, rets=None):
                     raise Unresolved(f"{args[0]!r} may split into several "
                                      f"arguments or vanish")  # unquoted
                 own = with_scoped(env, scoped)  # `CDPATH=x cd y` / `HOME=x cd`
-                cwd = (cd_target(args[0], cwd, env, physical, own.get("CDPATH", ""))
-                       if args else own.get("HOME"))
+                if not args:
+                    cwd = own.get("HOME")
+                else:                     # a `set -P` that may have run: both readings
+                    ends = {cd_target(args[0], cwd, env, p, own.get("CDPATH", ""))
+                            for p in ((True, False) if physical is None else (physical,))}
+                    cwd = ends.pop() if len({os.path.realpath(e) for e in ends}) == 1 \
+                        else None
                 if cwd == UNCERTAIN:
                     cwd = None
             except Unresolved:
@@ -1520,7 +1564,8 @@ def scan(cmd, cwd, env, depth, rets=None):
             else:                         # -c, or a cluster like -lc / -ec
                 raw, pos, from_stdin = shell_c_body(toks[1:])
             if raw:
-                scripts = variants(raw, env)  # `eval "$CMD"` runs what $CMD holds
+                scripts = [raw] if getattr(raw, "full", False) else \
+                    variants(raw, env)    # `eval "$CMD"` runs what $CMD holds
                 if pos:                   # `bash -c '"$@"' _ git stash`: the body runs its args
                     args = [substitute(a, env) for a in pos]  # (and, unless every `$` in
                     scripts = list(dict.fromkeys(             # it was quoted, maybe the
@@ -1848,6 +1893,14 @@ def judge_git(args, cwd, env, scoped=None, depth=0, opaque_cmd=False,
             action = "add"                # it may be: a false deny costs nothing
         if action == "add":
             WORKTREE_ADDED.append(True)
+        elif action == "move":            # `move [-f] <worktree> <new-path>`
+            ops = [w for w in rest[2:] if not w.startswith("-")]
+            try:
+                dest = os.path.realpath(resolve(ops[1], target, env)) \
+                    if len(ops) == 2 else None
+            except Unresolved:
+                dest = None
+            WORKTREE_MOVED.append(dest)
     if rest[0] != "stash" and ALIAS_WRITTEN and rest[0] not in GIT_BUILTINS and \
             not rest[0].startswith("-") and \
             not is_git_command(rest[0], git_env, seen, exec_opt):

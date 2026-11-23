@@ -15,7 +15,7 @@ T=$(cd "$(mktemp -d)" && pwd -P)
 case "$T" in *[!A-Za-z0-9/._-]*) rmdir "$T"; T=$(cd "$(mktemp -d /tmp/stash-guard.XXXXXX)" && pwd -P) ;; esac
 trap 'rm -rf "$T"' EXIT
 case "$T" in *[!A-Za-z0-9/._-]*) echo "setup failed: fixture root $T needs shell quoting"; exit 1 ;; esac
-unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
 # No developer git config reaches the fixtures or the hook's probes (a global
 # commit.gpgSign or alias would change results); scoped HOME= / XDG_CONFIG_HOME=
 # checks below still pick their own config dirs.
@@ -194,7 +194,7 @@ check "here string fed to bash"             "bash <<< 'git stash clear'"      "$
 check "here string to cat stays data"       "cat <<< 'git stash clear'"       "$WT" ALLOW
 check "here string is not a heredoc"        $'cat <<< text\ngit stash pop'   "$WT" DENY "linked worktree"
 check "cd in a skipped if branch"           "if false; then cd $SOLO; fi; git stash clear" "$WT" DENY "could not resolve"
-check "cd in then, stash in else"           "if false; then cd $SOLO; else git stash clear; fi" "$WT" DENY "could not resolve"
+check "cd in then, stash in else"           "if false; then cd $SOLO; else git stash clear; fi" "$WT" DENY "linked worktree"
 check "cd and stash in one branch"          "if true; then cd $SOLO && git stash pop; fi" "$WT" ALLOW
 check "cd in a loop body may not run"       "while false; do cd $SOLO; done; git stash pop" "$WT" DENY "could not resolve"
 check "command word from a variable"        "B=git; \"\$B\" stash pop"        "$WT" DENY "linked worktree"
@@ -545,6 +545,26 @@ probes=$(wc -l < "$T/deadline.log" | tr -d ' ')
 if [ "$probes" = 2 ] && python3 -c 'import sys, time; sys.exit(time.time() - float(sys.argv[1]) < 0.9)' "$t0"; then
   pass=$((pass+1)); echo "ok   TIME   the deadline, not a lookup error, denied it"
 else fail=$((fail+1)); echo "FAIL: probes share one deadline: $probes probe(s), not the 2 a timeout takes"; fi
+
+# --- CodeRabbit round 12
+check "each if arm keeps its own exit"      "if test -n \"\$X\"; then cd $WT; else cd $SOLO; fi; git stash pop" "$SOLO" DENY "could not resolve"
+check "every arm ends solo: cwd stays known" "if test -n \"\$X\"; then cd $SOLO; else cd $SOLO; fi; git stash pop" "$WT" ALLOW
+check "elif with no else may run no arm"    "if test -n \"\$X\"; then cd $SOLO; elif test -n \"\$Y\"; then cd $SOLO; fi; git stash pop" "$WT" DENY "could not resolve"
+mkdir -p "$MAIN/sub"; ln -s "$MAIN/sub" "$SOLO/link"
+check "set -P makes cd physical"            "set -P; cd link/..; git stash pop" "$SOLO" DENY "other worktree"
+check "set -o physical makes cd physical"   "set -o physical; cd link/..; git stash pop" "$SOLO" DENY "other worktree"
+check "cd -L overrides set -P"              "set -P; cd -L link/..; git stash pop" "$SOLO" ALLOW
+check "set +P restores logical cd"          "set -P; set +P; cd link/..; git stash pop" "$SOLO" ALLOW
+check "logical cd by default"               "cd link/..; git stash pop"       "$SOLO" ALLOW
+check "a subshell alias write reruns a loop" "while read x; do git -C $WT shelfz; (git -C $WT config alias.shelfz 'stash pop'); done" "$PLAIN" DENY "may have written its alias"
+check "worktree move, then -C the new path" "git -C $MAIN worktree move $WT $T/moved && git -C $T/moved stash pop" "$PLAIN" DENY "worktree move"
+check "worktree move, an unrelated plain dir" "git -C $MAIN worktree move $WT $T/moved; git -C $PLAIN stash pop" "$SOLO" ALLOW
+check "export expands all operands first"   "D=$WT; export D=$SOLO GIT_DIR=\"\$D/.git\"; git stash pop" "$SOLO" DENY "linked worktree"
+check "a later export sees the new value"   "D=$WT; export D=$SOLO; export GIT_DIR=\"\$D/.git\"; git stash pop" "$PLAIN" ALLOW
+check "single-quoted -c body expands itself" "ACTION=pop; bash -c 'ACTION=list; git stash \"\$ACTION\"'" "$WT" ALLOW
+check "double-quoted -c body: caller expands" "ACTION=pop; bash -c \"ACTION=list; git stash \$ACTION\"" "$WT" DENY "linked worktree"
+check "definition redirection may skip it"  "f() { cd $SOLO; } > /nonexistent/out; f; git stash pop" "$WT" DENY "could not resolve"
+check "definition to /dev/null carries cd"  "f() { cd $SOLO; } > /dev/null; f; git stash pop" "$WT" ALLOW
 
 # --- the main checkout is guarded too while other worktrees exist
 check "main tree with a linked wt attached" "git stash"                       "$MAIN" DENY "other worktree"
