@@ -9,7 +9,12 @@
 set +o posix
 HOOK="$(CDPATH= cd "$(dirname "$0")" && pwd)/stash-guard.py"  # CDPATH= : cd prints nothing
 pass=0; fail=0
-T=$(cd "$(mktemp -d)" && pwd -P); trap 'rm -rf "$T"' EXIT
+# Fixture paths go unquoted into the Bash payloads below, so the root must
+# need no shell quoting: a TMPDIR with a space would split `-C $WT` in two.
+T=$(cd "$(mktemp -d)" && pwd -P)
+case "$T" in *[!A-Za-z0-9/._-]*) rmdir "$T"; T=$(cd "$(mktemp -d /tmp/stash-guard.XXXXXX)" && pwd -P) ;; esac
+trap 'rm -rf "$T"' EXIT
+case "$T" in *[!A-Za-z0-9/._-]*) echo "setup failed: fixture root $T needs shell quoting"; exit 1 ;; esac
 unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
 # No developer git config reaches the fixtures or the hook's probes (a global
 # commit.gpgSign or alias would change results); scoped HOME= / XDG_CONFIG_HOME=
@@ -50,7 +55,7 @@ if sys.argv[1] not in d.get("permissionDecisionReason",""): sys.exit(1)
 
 # --- mutating stash inside a linked worktree: denied
 check "bare git stash in linked wt"         "git stash"                       "$WT" DENY "linked worktree"
-check "git stash pop in linked wt"          "git stash pop"                   "$WT" DENY "git worktree add"
+check "git stash pop in linked wt"          "git stash pop"                   "$WT" DENY "is a linked worktree"
 check "git -C <wt> stash push -- f"         "git -C $WT stash push -- f"      "$PLAIN" DENY "linked worktree"
 check "stash apply"                         "git stash apply stash@{1}"       "$WT" DENY
 check "stash drop"                          "git stash drop"                  "$WT" DENY
@@ -343,7 +348,7 @@ check "for over a solo repo"                "for W in $SOLO; do git -C \"\$W\" s
 check "glob -C target is unresolved"        "git -C main.w* stash pop"        "$T" DENY "could not resolve"
 check "brace -C target is unresolved"       "git -C {main.wt,} stash pop"     "$T" DENY "could not resolve"
 check "glob -C, read-only stash"            "git -C main.w* stash list"       "$T" ALLOW
-check "worktree add before a solo stash"    "git -C $SOLO worktree add --detach $T/new HEAD && git -C $SOLO stash" "$PLAIN" DENY "worktree add"
+check "worktree add before a solo stash"    "git -C $SOLO worktree add --detach $T/new HEAD && git -C $SOLO stash" "$PLAIN" DENY "may attach another worktree"
 check "worktree add after the stash"        "git -C $SOLO stash; git -C $SOLO worktree add --detach $T/new HEAD" "$PLAIN" ALLOW
 check "here string to a script is data"     "bash read-line.sh <<< 'git stash pop'" "$WT" ALLOW
 check "here string to bash -s is the script" "bash -s <<< 'git stash pop'"    "$WT" DENY "linked worktree"
@@ -370,15 +375,21 @@ check "child shell keeps its own \$PWD"     "bash -c 'git -C \"\$PWD\" stash cle
 check "env -C unknown dir, child \$PWD"     "env -C \"\$NOPE_UNSET\" bash -c 'git -C \"\$PWD\" stash pop'" "$SOLO" DENY "could not resolve"
 g -C "$MAIN" config alias.pw '!git -C "$PWD" stash clear'
 check "shell alias \$PWD is its top level"  "git -C $WT pw"                   "$SOLO" DENY "linked worktree"
-check "-c subsection alias runs a stash"    "git -c 'alias.sv.command=stash clear' sv" "$WT" DENY "linked worktree"
 g -C "$MAIN" config alias.shelf3.command 'stash pop'
-check "configured subsection alias"         "git shelf3"                      "$WT" DENY "linked worktree"
-check "subsection alias, read-only"         "git -c alias.sl.command='stash list' sl" "$WT" ALLOW
-check "later plain alias wins"              "git -c alias.zz.command='stash clear' -c alias.zz=status zz" "$WT" ALLOW
-check "later subsection alias wins"         "git -c alias.zz=status -c alias.zz.command='stash clear' zz" "$WT" DENY "linked worktree"
-check "subsection name is case-sensitive"   "git -c alias.ZQ.command='stash clear' zq" "$WT" ALLOW
-check "subsection name with a space"        "git -c 'alias.a b.command=stash clear' 'a b'" "$WT" DENY "linked worktree"
-check "unresolved command word, -c subsection" "cd $T/nope; \"\$NOPE_UNSET_VAR\" -c alias.p.command='stash pop' p" "$WT" DENY "could not be resolved"
+# `[alias "x"] command` dispatches only from git 2.54; an older git reads the key
+# but never runs it, so these cases would pass without testing what they name.
+if git -c alias.sgprobe.command=version sgprobe >/dev/null 2>&1; then
+  check "-c subsection alias runs a stash"    "git -c 'alias.sv.command=stash clear' sv" "$WT" DENY "linked worktree"
+  check "configured subsection alias"         "git shelf3"                      "$WT" DENY "linked worktree"
+  check "subsection alias, read-only"         "git -c alias.sl.command='stash list' sl" "$WT" ALLOW
+  check "later plain alias wins"              "git -c alias.zz.command='stash clear' -c alias.zz=status zz" "$WT" ALLOW
+  check "later subsection alias wins"         "git -c alias.zz=status -c alias.zz.command='stash clear' zz" "$WT" DENY "linked worktree"
+  check "subsection name is case-sensitive"   "git -c alias.ZQ.command='stash clear' zq" "$WT" ALLOW
+  check "subsection name with a space"        "git -c 'alias.a b.command=stash clear' 'a b'" "$WT" DENY "linked worktree"
+  check "unresolved command word, -c subsection" "cd $T/nope; \"\$NOPE_UNSET_VAR\" -c alias.p.command='stash pop' p" "$WT" DENY "could not be resolved"
+else
+  echo "skip subsection-alias cases: $(git --version) does not dispatch alias.<name>.command"
+fi
 g -C "$MAIN" config alias.bx '!bash -c "$1"'
 check "shell alias binds \$1"               "git bx 'git stash clear'"        "$WT" DENY "linked worktree"
 check "shell alias \$1, read-only"          "git bx 'git stash list'"         "$WT" ALLOW
@@ -462,8 +473,27 @@ check "bash -c 'git \"\$@\"' runs its operands" "bash -c 'git \"\$@\"' _ stash l
 check "bash -c 'git \"\$@\"', mutating"       "bash -c 'git \"\$@\"' _ stash pop" "$WT" DENY "linked worktree"
 check "reason says to stop on extra staged" "git stash"                       "$WT" DENY "lists only those paths"
 # --- CodeRabbit round 10
-check "worktree action from a variable"     "A=add; git -C $SOLO worktree \$A --detach $T/new10 HEAD && git -C $SOLO stash" "$PLAIN" DENY "worktree add"
-check "worktree action after an empty word" "E=; git -C $SOLO worktree \$E add --detach $T/new11 HEAD && git -C $SOLO stash" "$PLAIN" DENY "worktree add"
+check "worktree action from a variable"     "A=add; git -C $SOLO worktree \$A --detach $T/new10 HEAD && git -C $SOLO stash" "$PLAIN" DENY "may attach another worktree"
+check "worktree action after an empty word" "E=; git -C $SOLO worktree \$E add --detach $T/new11 HEAD && git -C $SOLO stash" "$PLAIN" DENY "may attach another worktree"
+check "a loop pass adds a worktree"         "while read x; do git -C $SOLO stash pop; git -C $SOLO worktree add --detach $T/new12 HEAD; done" "$PLAIN" DENY "may attach another worktree"
+check "a loop with no worktree add"         "while read x; do git -C $SOLO stash pop; done" "$PLAIN" ALLOW
+check "empty word before the subcommand"    "E=; S=stash; git \$E \"\$S\" pop" "$WT" DENY "linked worktree"
+check "empty word, read-only subcommand"    "E=; S=stash; git \$E \"\$S\" list" "$WT" ALLOW
+check "empty word before an option"         "E=; git \$E -C $WT stash pop"    "$PLAIN" DENY "linked worktree"
+check "empty word before the command word"  "E=; G=git; \$E \$G stash pop"    "$WT" DENY "linked worktree"
+check "backslash-newline in double quotes"  $'git "sta\\\nsh" pop'          "$WT" DENY "linked worktree"
+check "dup after a close may fail"          "cd $SOLO 1>&- 2>&1; git stash pop" "$WT" DENY "could not resolve"
+check "dup of an open fd still runs"        "cd $SOLO 2>&1; git stash pop"    "$WT" ALLOW
+check "dup of an fd opened before it"       "cd $SOLO 3>&1 2>&3; git stash pop" "$WT" ALLOW
+check "read-only stash at the depth bound"  "eval eval eval eval git stash list" "$WT" ALLOW
+check "git function at the depth bound"     "git() { command git stash pop; }; eval eval eval eval git stash list" "$WT" DENY
+mkdir -p "$T/ext"; printf '#!/bin/sh\n' > "$T/ext/git-shelfx"; chmod +x "$T/ext/git-shelfx"
+PATH="$T/ext:$PATH" \
+check "a real git-<name> beats its alias"   "git -c alias.shelfx='stash pop' shelfx" "$WT" ALLOW
+check "no git-<name>: the alias runs"       "git -c alias.shelfx='stash pop' shelfx" "$WT" DENY "linked worktree"
+PATH="$T/ext:$PATH" \
+check "the request's PATH drops git-<name>" "PATH=/nonexistent git -c alias.shelfx='stash pop' shelfx" "$WT" DENY "linked worktree"
+check "--exec-path= finds git-<name>"       "git --exec-path=$T/ext -c alias.shelfx='stash pop' shelfx" "$WT" ALLOW
 check "unknown command word, solo cwd"      "\"\$NOPE_UNSET_VAR\" stash pop"   "$SOLO" DENY "could not be resolved"
 check "empty expansion: next word is the sub" "E=; git stash \$E list"          "$WT" ALLOW
 check "empty expansion, then a mutating sub" "E=; git stash \$E pop"           "$WT" DENY "linked worktree"

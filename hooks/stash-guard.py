@@ -462,11 +462,11 @@ def words(seg):
     operand); each `<<<` operand is kept as a here string, and a heredoc
     operator's delimiter word is dropped (its body is in seg.docs). A word
     with a quoted or escaped `$` is a Lit."""
-    out, here, redirs, raw, pending = [], [], [], [], None
+    out, here, redirs, raw, pending, fd = [], [], [], [], None, None
     i, n, q = 0, len(seg), None
 
     def flush():
-        nonlocal raw, pending
+        nonlocal raw, pending, fd
         if not raw:
             return
         text = "".join(raw)
@@ -481,8 +481,8 @@ def words(seg):
         elif pending == "<<<":
             here.append(w)
         elif pending not in ("<<", "<<-"):
-            redirs.append((pending, w))
-        pending = None
+            redirs.append((fd or ("0" if pending[0] == "<" else "1"), pending, w))
+        pending = fd = None
 
     while i < n:
         c = seg[i]
@@ -507,7 +507,7 @@ def words(seg):
             flush()
         elif c in "<>" or seg.startswith("&>", i):
             if FD_WORD.fullmatch("".join(raw)):
-                raw = []                  # `2>` / `{fd}>`: the fd is not a word
+                fd, raw = "".join(raw), []  # `2>` / `{fd}>`: the fd is not a word
             flush()
             pending = REDIR_OP.match(seg, i).group(0)
             i += len(pending)
@@ -573,11 +573,12 @@ def segments_at(s):
                 segs += [x for b in bodies for x in (OPEN, *segments(b), CLOSE)]
                 buf.append(SUBST)
                 continue
-            buf.append(c)
             if c == "\\" and q == '"' and i + 1 < n:
-                buf.append(s[i + 1])
+                if s[i + 1] != "\n":      # `"sta\<newline>sh"` is `stash`: both go
+                    buf += [c, s[i + 1]]
                 i += 2
                 continue
+            buf.append(c)
             if c == q:
                 q = None
             i += 1
@@ -714,6 +715,21 @@ def expand_word(word, env):
     if "$" not in word and "`" not in word and XARGS not in word:
         return [word]
     return expand(word, env).split()
+
+
+def vanished(ws, env):
+    """How many leading words of `ws` expand to nothing: an unquoted empty
+    expansion vanishes, so the word after it takes its place (`git $E "$S"
+    pop` runs what $S holds). A word that cannot be expanded ends the count."""
+    k = 0
+    while k < len(ws):
+        try:
+            if expand_word(ws[k], env):
+                break
+        except Unresolved:
+            break
+        k += 1
+    return k
 
 
 def first_word(ws, env):
@@ -1074,12 +1090,22 @@ def merge(cwd, env, cwd2, env2):
 
 
 def may_fail(redirs):
-    """Whether a command's redirections may fail, so that the shell skips the
-    command: any but /dev/null, or a dup / close (`>&` / `<&`) of fd 0-2,
-    which a hook's shell always has open. `>1` is a file named 1, and
-    `2>&9` fails when fd 9 is closed."""
-    return any(w != "/dev/null" and not (op in (">&", "<&") and w in ("-", "0", "1", "2"))
-               for op, w in redirs)
+    """Whether a command's (fd, operator, operand) redirections may fail, so
+    that the shell skips the command: any but /dev/null, or a dup / close
+    (`>&` / `<&`) of an open fd. They apply in order from fds 0-2, which a
+    hook's shell always has open: `1>&- 2>&1` dups the fd it just closed, and
+    `2>&9` fails when fd 9 is closed. `>1` is a file named 1."""
+    live = {"0", "1", "2"}
+    for fd, op, w in redirs:
+        if op in (">&", "<&") and w == "-":
+            if not fd.isdigit():
+                return True               # `{v}>&-` closes whichever fd $v holds
+            live.discard(fd)
+        elif (op in (">&", "<&") and w in live) or w == "/dev/null":
+            live.update(("1", "2") if op.startswith("&") else (fd,))
+        else:
+            return True
+    return False
 
 
 def shell_c_body(args):
@@ -1259,7 +1285,7 @@ def scan(cmd, cwd, env, depth, rets=None):
         try:
             toks, herestrs, redirs = words(seg)
         except ValueError:
-            toks, herestrs, redirs = seg.split(), [], [("<", "?")]
+            toks, herestrs, redirs = seg.split(), [], [("0", "<", "?")]
         if func is None and toks[:1] == ["function"] and toks[2:3] == ["{"]:
             func = (cwd, dict(env), lst, elem, cond, piped, blocks)
             fname, blocks, toks = toks[1], [], toks[2:]  # `function f {`: the body follows
@@ -1277,8 +1303,9 @@ def scan(cmd, cwd, env, depth, rets=None):
                 continue
             if w in OPENERS:              # a branch or loop body may be skipped
                 blocks.append([cwd, dict(env), w in LOOPS and loop_start(segs, idx),
-                               w, None, []])  # ..., opener, merged ends of case arms,
-                                              # states at a `continue` / `break`
+                               w, None, [], len(WORKTREE_ADDED)])
+                # ..., opener, merged ends of case arms, states at a `continue` /
+                # `break`, and the `git worktree add`s seen before it opened
                 if w == "case":           # `case WORD in` runs no command
                     toks = []
             if w in ("for", "select") and toks and ASSIGN.match(toks[0] + "="):
@@ -1287,13 +1314,16 @@ def scan(cmd, cwd, env, depth, rets=None):
             elif w in ("else", "elif") and blocks:
                 cwd, env = merge(cwd, env, *blocks[-1][:2])
             elif w in CLOSERS and blocks:
-                c0, e0, start, _, arms, jumps = blocks.pop()
+                c0, e0, start, _, arms, jumps, added = blocks.pop()
                 cwd, env = merge(cwd, env, c0, e0)
                 if arms:                  # any arm that ran may be the one that ended it
                     cwd, env = merge(cwd, env, *arms)
                 for j in jumps:           # a pass, or the loop, may end at continue / break
                     cwd, env = merge(cwd, env, *j)
-                if start is not False and (cwd, env) != (c0, e0):
+                # A pass that adds a worktree changes the next pass too: its
+                # stash may then run beside the new worktree.
+                if start is not False and ((cwd, env) != (c0, e0) or
+                                           len(WORKTREE_ADDED) != added):
                     reason, cwd, env = later_passes(segs[start:idx], cwd, env,
                                                     depth, rets)
                     if reason:
@@ -1306,8 +1336,9 @@ def scan(cmd, cwd, env, depth, rets=None):
             continue
         opaque = None
         if toks and ("$" in toks[0] or "`" in toks[0] or XARGS in toks[0]):
+            toks = toks[vanished(toks, env):]  # `E=; $E "$G" stash`: $G runs
             try:                          # `"$B" stash pop` runs what $B holds
-                toks = expand_word(toks[0], env) + toks[1:]
+                toks = (expand_word(toks[0], env) if toks else []) + toks[1:]
             except Unresolved as e:
                 opaque = str(e)
             else:
@@ -1517,7 +1548,7 @@ def scan(cmd, cwd, env, depth, rets=None):
                 cwd, env = c, e
                 continue
             if depth >= MAX_DEPTH:
-                reason = nested_bar(scripts, depth)
+                reason = nested_bar(scripts, depth, env)
                 if reason:
                     return reason, cwd, env
                 continue
@@ -1624,9 +1655,20 @@ def forward_seg(seg, args):
     return out
 
 
-def nested_bar(texts, depth):
+def read_only_stash(text, env):
+    """Whether `text` is one plain `git stash list` / `show` and nothing more:
+    no expansion, quoting, redirection, second command or `git` function, so
+    nothing in it is left to inspect."""
+    toks = text.split()
+    return re.fullmatch(r"[\w \t./@{}=:^~%+-]*", text) is not None and \
+        toks[:2] == ["git", "stash"] and len(toks) > 2 and toks[2] in READ_ONLY and \
+        FUNC + "git" not in env
+
+
+def nested_bar(texts, depth, env):
     """The deny reason when bodies past the scan depth may run a stash."""
-    if depth >= MAX_DEPTH and any(may_stash(t) or may_git(t) for t in texts):
+    if depth >= MAX_DEPTH and any((may_stash(t) or may_git(t)) and
+                                  not read_only_stash(t, env) for t in texts):
         return ("[stash-guard] Blocked a shell body that may run `git stash` "
                 "(or a git alias for one): "
                 "it is nested too deeply to inspect, and an uninspected "
@@ -1661,7 +1703,7 @@ def run_here(scripts, texts, cwd, env, scoped, depth, rets=None):
     `rets`; a function call (`rets` None) collects its own, and its state
     afterwards is uncertain wherever a `return` state and its end disagree."""
     if depth >= MAX_DEPTH:
-        reason = nested_bar(texts, depth)
+        reason = nested_bar(texts, depth, env)
         return (reason, cwd, env) if reason else (None, *invalidated(env))
     try:
         body_env = with_scoped(env, scoped)
@@ -1717,7 +1759,7 @@ def judge_git(args, cwd, env, scoped=None, depth=0, opaque_cmd=False,
     it split only ever denies more."""
     scoped = scoped or {}
     target, git_dir, work_tree, configs, i = cwd, None, None, [], 0
-    pending_unresolved = config_unresolved = None
+    pending_unresolved = config_unresolved = exec_opt = None
     while i < len(args) and args[i].startswith("-"):
         opt = args[i]
         name, _, inline = opt.partition("=")
@@ -1734,6 +1776,9 @@ def judge_git(args, cwd, env, scoped=None, depth=0, opaque_cmd=False,
         try:
             if name == "-C" and value:
                 target = resolve(value, target, env, physical=True)
+            elif name == "--exec-path" and inline:
+                exec_opt = UNCERTAIN      # where git finds `git-<name>`, once known
+                exec_opt = path_word(Lit(inline) if isinstance(opt, Lit) else inline, env)
             elif name == "--git-dir" and value:
                 git_dir = path_word(value, env)
             elif name == "--work-tree" and value:
@@ -1754,10 +1799,11 @@ def judge_git(args, cwd, env, scoped=None, depth=0, opaque_cmd=False,
     if i >= len(args):
         return None
     opaque = None
+    w0 = i + vanished(args[i:], env)      # `git $E "$S" pop`: $E vanishes
     try:                                  # `git "$S" pop` runs what $S holds
-        rest = expand_word(args[i], env) + args[i + 1:]
+        rest = (expand_word(args[w0], env) if w0 < len(args) else []) + args[w0 + 1:]
     except Unresolved as e:
-        rest, opaque = ["stash"] + args[i + 1:], str(e)
+        rest, opaque = ["stash"] + args[w0 + 1:], str(e)
     if not rest:
         return None
     if rest[0].startswith("-") and rest[0] != args[i]:
@@ -1803,7 +1849,8 @@ def judge_git(args, cwd, env, scoped=None, depth=0, opaque_cmd=False,
         if action == "add":
             WORKTREE_ADDED.append(True)
     if rest[0] != "stash" and ALIAS_WRITTEN and rest[0] not in GIT_BUILTINS and \
-            not rest[0].startswith("-") and not is_git_command(rest[0], git_env):
+            not rest[0].startswith("-") and \
+            not is_git_command(rest[0], git_env, seen, exec_opt):
         return blocked(f"`git {rest[0]}`", "a `git config` earlier in this "
                        "command may have written its alias, which may run a "
                        "stash in any repo (`!cd /other && git stash`)")
@@ -1829,10 +1876,10 @@ def judge_git(args, cwd, env, scoped=None, depth=0, opaque_cmd=False,
             return None                   # no repo whose config could define it
         return judge_alias(rest, target, git_dir, work_tree, configs,
                            config_unresolved, seen, git_env, depth,
-                           str(where) if where else None)
+                           str(where) if where else None, exec_opt)
     doubt = None                          # `git $X` / `$G stash`: the word may hold
-    if opaque_cmd or (opaque and args[i][:1] in ("$", "`")) or \
-            (opaque and args[i].startswith(XARGS)):  # `-C <dir>` / `--git-dir`
+    if opaque_cmd or (opaque and args[w0][:1] in ("$", "`")) or \
+            (opaque and args[w0].startswith(XARGS)):  # `-C <dir>` / `--git-dir`
         doubt = (f"{opaque or 'the command word is unresolved'}, and it may "
                  f"expand to git options naming another repo than this one")
     try:
@@ -1843,7 +1890,7 @@ def judge_git(args, cwd, env, scoped=None, depth=0, opaque_cmd=False,
         return None
     label = f"`git stash{'' if len(rest) < 2 else ' ' + rest[1]}`"
     if opaque:
-        label = f"`git {' '.join(args[i:i + 2])}`"
+        label = f"`git {' '.join(args[w0:w0 + 2])}`"
     if pending_unresolved or target is None:
         return blocked(label, pending_unresolved or "the working directory is unknown")
     if isinstance(seen, Unresolved):
@@ -1898,16 +1945,21 @@ def config_var(k):
     return k.startswith("GIT_CONFIG") and k != "GIT_CONFIG"
 
 
-def is_git_command(name, git_env):
+def is_git_command(name, git_env, seen, exec_opt=None):
     """Whether `git <name>` runs a dashed command (`git-<name>` in git's
-    exec path or on $PATH), which git tries before any alias."""
-    if "/" in name:
+    exec path or on $PATH), which git tries before any alias. Both are the
+    invocation's own: its `--exec-path=`, else the $GIT_EXEC_PATH and $PATH
+    it exports. One it may set to an unknown value finds no command, and
+    only an absolute directory is searched."""
+    if "/" in name or isinstance(seen, Unresolved) or UNCERTAIN in (
+            exec_opt, seen.get("GIT_EXEC_PATH"), seen.get("PATH")):
         return False
-    r = git(["--exec-path"], git_env)
-    dirs = ([r.stdout.strip()] if r is not None and not r.returncode else []) + \
-        git_env.get("PATH", "").split(os.pathsep)
-    return any(d and os.access(os.path.join(d, "git-" + name), os.X_OK)
-               for d in dirs)
+    exec_dir = exec_opt if exec_opt is not None else seen.get("GIT_EXEC_PATH")
+    if exec_opt is None and not exec_dir:  # git's built-in one (an empty `=` is no dir)
+        r = git(["--exec-path"], git_env)
+        exec_dir = r.stdout.strip() if r is not None and not r.returncode else ""
+    return any(os.path.isabs(d) and os.access(os.path.join(d, "git-" + name), os.X_OK)
+               for d in [exec_dir, *seen.get("PATH", "").split(os.pathsep)])
 
 
 def final_word(words_):
@@ -1919,12 +1971,13 @@ def final_word(words_):
 
 
 def judge_alias(rest, target, git_dir, work_tree, configs, config_unresolved,
-                seen, git_env, depth, unresolved=None):
+                seen, git_env, depth, unresolved=None, exec_opt=None):
     """Deny reason when `git <rest>` runs an alias (`-c alias.x=...` on the
     command line, or configured) that can reach a mutating stash, else None.
     git ignores an alias that shadows a builtin, so those are not looked up.
     A `!` alias is a shell body run at the repo's top level. `unresolved`
-    says why the repo whose config may define it is unknown."""
+    says why the repo whose config may define it is unknown. A real
+    `git-<name>` command runs before any alias of that name."""
     name = rest[0]
     if name in GIT_BUILTINS or name.startswith("-"):
         return None
@@ -1933,7 +1986,7 @@ def judge_alias(rest, target, git_dir, work_tree, configs, config_unresolved,
         return blocked(label, f"a `-c` value that may define its alias "
                               f"cannot be expanded: {config_unresolved}")
     if unresolved:
-        if is_git_command(name, git_env):
+        if is_git_command(name, git_env, seen, exec_opt):
             return None                   # a real command: no alias can shadow it
         return blocked(label, f"it may be an alias defined in that repo's "
                               f"config: {unresolved}")
@@ -1961,8 +2014,8 @@ def judge_alias(rest, target, git_dir, work_tree, configs, config_unresolved,
         key, _, val = entry.partition("\n")
         if key in keys:
             value = val.strip()
-    if not value:
-        return None
+    if not value or is_git_command(name, git_env, seen, exec_opt):
+        return None                       # no alias, or a real command it cannot shadow
     if depth >= MAX_DEPTH:                # past here only a builtin ends the chain
         if value.startswith("!"):
             ends = not may_stash(value) and "git" not in value
