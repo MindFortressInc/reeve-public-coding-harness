@@ -196,7 +196,7 @@ check "command word from a variable"        "B=git; \"\$B\" stash pop"        "$
 check "subcommand from a variable"          "S=stash; git \"\$S\" pop"        "$WT" DENY "linked worktree"
 check "read-only stash sub from a variable" "S=list; git stash \"\$S\""       "$WT" ALLOW
 check "unknown subcommand word, shared"     "git \"\$NOPE_UNSET_VAR\" pop"    "$WT" DENY "could not be resolved"
-check "unknown subcommand word, solo"       "git \"\$NOPE_UNSET_VAR\" pop"    "$SOLO" ALLOW
+check "unknown subcommand word, solo"       "git \"\$NOPE_UNSET_VAR\" pop"    "$SOLO" DENY "naming another repo"
 check "unknown command word, shared"        "\"\$NOPE_UNSET_VAR\" stash pop"  "$WT" DENY "could not be resolved"
 check "unknown command word, unrelated"     "\"\$NOPE_UNSET_VAR\" notes.md"   "$WT" ALLOW
 check "timeout wrapper"                     "timeout 10 git stash pop"        "$WT" DENY "linked worktree"
@@ -461,6 +461,24 @@ check "break leaves the loop's state"       "for i in 1; do cd $WT; break; cd $S
 check "bash -c 'git \"\$@\"' runs its operands" "bash -c 'git \"\$@\"' _ stash list" "$WT" ALLOW
 check "bash -c 'git \"\$@\"', mutating"       "bash -c 'git \"\$@\"' _ stash pop" "$WT" DENY "linked worktree"
 check "reason says to stop on extra staged" "git stash"                       "$WT" DENY "lists only those paths"
+# --- CodeRabbit round 10
+check "worktree action from a variable"     "A=add; git -C $SOLO worktree \$A --detach $T/new10 HEAD && git -C $SOLO stash" "$PLAIN" DENY "worktree add"
+check "worktree action after an empty word" "E=; git -C $SOLO worktree \$E add --detach $T/new11 HEAD && git -C $SOLO stash" "$PLAIN" DENY "worktree add"
+check "unknown command word, solo cwd"      "\"\$NOPE_UNSET_VAR\" stash pop"   "$SOLO" DENY "could not be resolved"
+check "empty expansion: next word is the sub" "E=; git stash \$E list"          "$WT" ALLOW
+check "empty expansion, then a mutating sub" "E=; git stash \$E pop"           "$WT" DENY "linked worktree"
+mkdir -p "$T/sp ace"
+check "cd \$D that splits does not land"     "D='$T/sp ace'; cd \$D; git stash pop" "$WT" DENY "could not resolve"
+check "cd with several arguments"           "cd $SOLO $PLAIN; git stash pop"  "$WT" DENY "could not resolve"
+check "cd \$D, one word, still lands"         "D=$SOLO; cd \$D; git stash pop"  "$WT" ALLOW
+check "alias past the scan depth"           "eval eval eval eval git shelf2"  "$WT" DENY "nested too deeply"
+check "set -a exports a later assignment"   "set -a; GIT_DIR=$MAIN/.git; git stash pop" "$PLAIN" DENY "other worktree"
+check "set -o allexport exports too"        "set -euo allexport; GIT_DIR=$MAIN/.git; git stash pop" "$PLAIN" DENY "other worktree"
+check "set +a turns it off"                 "set -a; set +a; GIT_DIR=$MAIN/.git; git stash pop" "$PLAIN" ALLOW
+check "set -a that may not have run"        "true && set -a; GIT_DIR=$MAIN/.git; git stash pop" "$PLAIN" DENY "may not have run"
+check "eval with a failing redirection"     "eval 'cd $SOLO' >$T/missing/log; git stash pop" "$WT" DENY "could not resolve"
+check "eval >/dev/null still runs"          "eval 'cd $SOLO' >/dev/null; git stash pop" "$WT" ALLOW
+check "function call, failing redirection"  "f() { cd $SOLO; }; f >$T/missing/log; git stash pop" "$WT" DENY "could not resolve"
 # Shims exec the real git through a path with a space, so an unquoted one breaks.
 sq() { printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"; }
 mkdir -p "$T/bin" "$T/real git" "$T/evil"; ln -s "$(command -v git)" "$T/real git/git"; REAL_GIT="$T/real git/git"

@@ -19,8 +19,10 @@ The target is resolved per segment: the hook's cwd (or inherited GIT_DIR),
 then any `cd` earlier in the chain (scoped to its `( )` / `$(...)` / backquote
 subshell, pipeline element or backgrounded list; unknown once an and-or list,
 `if` / loop / `case` branch or function body it may not have run in ends;
-`pushd -n` leaves it; a `cd`, `export` or `unset` with a redirection that
-may fail (any but /dev/null or a dup / close of fd 0-2) may not have run;
+`pushd -n` leaves it; a `cd` with several arguments, or whose `$VAR` may
+split or vanish, lands nowhere known; a `cd`, `export`, `unset`, `set`,
+`eval` or function call with a redirection that may fail (any but /dev/null
+or a dup / close of fd 0-2) may not have run;
 `continue` / `break` end a loop pass with their state; each `case` arm
 starts from the state before the `case`, one after `;&` / `;;&` maybe
 from the last arm's;
@@ -31,7 +33,8 @@ starts; `CDPATH=` / `HOME=` prefixes on the `cd` itself apply), then
 `--work-tree` (left for git to resolve after every `-C`);
 VAR=val prefixes, `unset` and `env -u` / `-i` shape the GIT_* vars the probe
 sees (git's repo discovery vars included), a plain assignment reaches git or a
-child shell only once exported, a `local` / `declare` value is uncertain
+child shell only once exported (or under `set -a`), a `local` / `declare`
+value is uncertain
 (it may shadow the caller's only inside a function), and
 an export that may not have run leaves its var uncertain. Quote-, comment-,
 redirection- and heredoc-aware, so "git stash" inside an echo/grep/commit
@@ -52,8 +55,10 @@ alias is denied as a possible stash (it may run anywhere); a body is judged
 both with the caller's $VARs expanded first and with the body expanding them
 itself, since quote removal hides which
 happens (unless every `$` in it was quoted). `$VAR` command and subcommand
-words are expanded before matching, and one that expands to git options
-(`git $opts stash`) is parsed as them.
+words are expanded before matching (an empty one vanishes, so the next word
+takes its place), and one that expands to git options
+(`git $opts stash`) is parsed as them; an unresolvable one may hold options
+naming another repo, so it is denied even where this repo's stack is solo.
 An arithmetic `$(( ))` is not a command: only the substitutions inside it
 (and its text, if it may spell a stash) are scanned.
 `env` / shells / `eval` / wrappers (`time -p`, `command -p`, `sudo -u X`,
@@ -79,7 +84,8 @@ A mutating stash whose target cannot be resolved (an unknown $VAR, a `$(...)`,
 a path word a glob or brace may expand or that holds a quoted `$`, a `cd`
 into a missing or unenterable directory, a failed or timed-out repo, worktree
 or alias probe, an unresolvable command or subcommand word or `env -S`
-string, shell bodies or aliases nested past the scan depth, a command nested
+string, shell bodies or aliases nested past the scan depth that may run git,
+a command nested
 past the parse depth) is denied.
 Known gaps: a heredoc piped into a shell (`cat <<EOF | bash`) is not seen; an
 alias written by anything but `git config` (`>> .git/config`) is not seen; a
@@ -115,7 +121,7 @@ OPENERS = {"if", "while", "until", "for", "select", "case"}
 LOOPS = {"while", "until", "for", "select"}
 DECLARE = {"local", "declare", "typeset", "readonly"}
 STATE_BUILTINS = {"cd", "pushd", "popd", "export", "unset", "return",
-                  "continue", "break"} | DECLARE
+                  "continue", "break", "set"} | DECLARE
 LOOP_PASSES = 8                           # loop-carried state converges well before this
 CLOSERS = {"fi", "done", "esac"}
 BLOCK_WORDS = OPENERS | CLOSERS | {"then", "do", "else", "elif", "{", "}", "!"}
@@ -172,6 +178,7 @@ PIPE, BG = "\0p", "\0b"                    # | or |& / a lone & from segments()
 UNCERTAIN = "\0?"                         # env value: a step that may not have run set it
 LOCAL = "\0l"                             # env key prefix: that var is set but not exported
 EXPORT = "\0x"                            # env key prefix: that var is exported but not set
+ALLEXPORT = "\0A"                        # env key: `set -a` is on, so assignments export
 MAX_DEPTH = 3                             # nested shell/eval bodies scanned
 MAX_NEST = 50                             # nested $(...) / backquotes parsed (no agent nests
                                           # near this; past it the parse would recurse unbounded)
@@ -709,6 +716,18 @@ def expand_word(word, env):
     return expand(word, env).split()
 
 
+def first_word(ws, env):
+    """The first word `ws` leaves once each expands: an unquoted expansion
+    that is empty vanishes, so the word after it takes its place (a quoted
+    empty one makes git fail outright). None when every one vanishes.
+    Raises Unresolved when a word cannot be expanded."""
+    for w in ws:
+        ex = expand_word(w, env)
+        if ex:
+            return ex[0]
+    return None
+
+
 def path_word(word, env):
     """A path word once expanded. Quote removal hides whether a glob or brace
     in it expands (`git -C main.w*` reaches git as `main.wt`), so one that may
@@ -1011,7 +1030,7 @@ def exported_env(env, scoped):
     A command-scoped VAR=val always reaches the child; a var whose export may
     not have run is UNCERTAIN."""
     out = {k: v for k, v in with_scoped(env, scoped).items()
-           if not k.startswith((FUNC, EXPORT))}
+           if not k.startswith((FUNC, EXPORT)) and k != ALLEXPORT}
     for k in [k for k in out if k.startswith(LOCAL)]:
         name, flag = k[len(LOCAL):], out.pop(k)
         if name in scoped or name not in out:
@@ -1118,6 +1137,12 @@ def forward(body, args):
 def may_stash(text):
     """Whether `text` could spell `stash` once quotes are removed."""
     return "stash" in re.sub(r"[\"'\\$\n]", "", text)
+
+
+def may_git(text):
+    """Whether `text` could run git once quotes are removed: any git command
+    may be an alias that stashes without spelling it."""
+    return "git" in re.sub(r"[\"'\\$\n]", "", text)
 
 
 def child_pwd(env, cwd):
@@ -1303,10 +1328,7 @@ def scan(cmd, cwd, env, depth, rets=None):
             for k, v in scoped.items():   # bare `A=b` sets shell state
                 if v is None:
                     continue
-                if k not in env:          # a new var stays unexported, unless
-                    flag = env.pop(EXPORT + k, None)  # `export k` ran while unset
-                    if flag != "1":
-                        env[LOCAL + k] = UNCERTAIN if flag == UNCERTAIN else "1"
+                assigned(env, k)
                 try:
                     env[k] = expand(v, env)
                 except Unresolved:
@@ -1334,6 +1356,8 @@ def scan(cmd, cwd, env, depth, rets=None):
                     return reason, cwd, env
                 e2.setdefault(FUNC + head, bodies)
                 c, e = merge(c, e, c2, e2)
+            if may_fail(redirs):          # a failed redirection skips the call
+                c, e = merge(cwd, env, c, e)
             cwd, env = c, e
             continue
         if head == "return":              # the function's state may end here
@@ -1352,6 +1376,31 @@ def scan(cmd, cwd, env, depth, rets=None):
                 if k not in env:
                     env[LOCAL + k] = UNCERTAIN  # it may be exported (`-x`) or not
                 env[k] = UNCERTAIN
+            continue
+        if head == "set":                 # `set -a` / `-o allexport`: later
+            old_env, on, k = dict(env), None, 1   # assignments are exported
+            while k < len(toks):
+                t = toks[k]
+                if "$" in t or "`" in t or XARGS in t:
+                    on = UNCERTAIN        # `set $OPTS`: it may be -a
+                    break
+                if t in ("-", "--") or len(t) < 2 or t[0] not in "-+":
+                    break                 # the positional parameters follow
+                if "a" in t[1:]:
+                    on = t[0] == "-"
+                if "o" in t[1:]:          # -o / -eo NAME: the name follows
+                    k += 1
+                    if toks[k:k + 1] == ["allexport"]:
+                        on = t[0] == "-"
+                k += 1
+            if on is True:
+                env[ALLEXPORT] = "1"
+            elif on is False:
+                env.pop(ALLEXPORT, None)
+            elif on == UNCERTAIN:
+                env[ALLEXPORT] = UNCERTAIN
+            if may_fail(redirs):          # a failed redirection skips it
+                cwd, env = merge(cwd, old_env, cwd, env)
             continue
         if head in ("export", "unset"):
             old_env = dict(env)
@@ -1395,6 +1444,11 @@ def scan(cmd, cwd, env, depth, rets=None):
                 if head == "popd" or args[:1] == ["-"] or \
                         (head == "pushd" and not args):  # swap / rotate (-N)
                     raise Unresolved("cd -/popd target is not tracked")
+                if len(args) > 1:         # bash 4+ fails, bash 3.2 takes the first
+                    raise Unresolved("a cd with several arguments")
+                if args and len(expand_word(args[0], env)) != 1:
+                    raise Unresolved(f"{args[0]!r} may split into several "
+                                     f"arguments or vanish")  # unquoted
                 own = with_scoped(env, scoped)  # `CDPATH=x cd y` / `HOME=x cd`
                 cwd = (cd_target(args[0], cwd, env, physical, own.get("CDPATH", ""))
                        if args else own.get("HOME"))
@@ -1454,10 +1508,13 @@ def scan(cmd, cwd, env, depth, rets=None):
             if not scripts:
                 continue
             if name == "eval" and lookup != EXTERNAL:  # eval shares this shell
-                reason, cwd, env = run_here(scripts, scripts, cwd, env, scoped,
-                                            depth, rets)
+                reason, c, e = run_here(scripts, scripts, cwd, env, scoped,
+                                        depth, rets)
                 if reason:
                     return reason, cwd, env
+                if may_fail(redirs):      # a failed redirection skips the eval
+                    c, e = merge(cwd, env, c, e)
+                cwd, env = c, e
                 continue
             if depth >= MAX_DEPTH:
                 reason = nested_bar(scripts, depth)
@@ -1504,11 +1561,25 @@ def bind_loop_var(toks, env, known):
             val = vals[0] if len(vals) == 1 else UNCERTAIN
         except Unresolved:
             pass
-    if name not in env:                   # like a bare assignment: unexported
-        flag = env.pop(EXPORT + name, None)
-        if flag != "1":
-            env[LOCAL + name] = UNCERTAIN if flag == UNCERTAIN else "1"
+    assigned(env, name)                   # like a bare assignment
     env[name] = val
+
+
+def assigned(env, k):
+    """Mark `k` as set by a plain assignment: a new var stays unexported,
+    unless `export k` ran while it was unset or `set -a` (allexport) is on,
+    which exports every assignment; an allexport that may be on leaves an
+    unexported var's export uncertain."""
+    ax = env.get(ALLEXPORT)
+    if ax == "1":
+        env.pop(LOCAL + k, None)
+        env.pop(EXPORT + k, None)
+    elif k not in env:
+        flag = env.pop(EXPORT + k, None)
+        if flag != "1":
+            env[LOCAL + k] = UNCERTAIN if flag == UNCERTAIN or ax else "1"
+    elif ax and env.get(LOCAL + k) == "1":
+        env[LOCAL + k] = UNCERTAIN
 
 
 def loop_start(segs, idx):
@@ -1555,8 +1626,9 @@ def forward_seg(seg, args):
 
 def nested_bar(texts, depth):
     """The deny reason when bodies past the scan depth may run a stash."""
-    if depth >= MAX_DEPTH and any(may_stash(t) for t in texts):
-        return ("[stash-guard] Blocked a shell body that may run `git stash`: "
+    if depth >= MAX_DEPTH and any(may_stash(t) or may_git(t) for t in texts):
+        return ("[stash-guard] Blocked a shell body that may run `git stash` "
+                "(or a git alias for one): "
                 "it is nested too deeply to inspect, and an uninspected "
                 "mutating stash is denied by default. " + ALTERNATIVES)
     return None
@@ -1575,7 +1647,7 @@ def invalidated(env):
     """(cwd, env) after a body that runs in this shell went uninspected: any
     cwd, var or export it touched is unknown, git's target vars included."""
     out = {k: (v if k.startswith(FUNC) else UNCERTAIN) for k, v in env.items()}
-    out.update(dict.fromkeys(GIT_TARGET + CONFIG_HOME, UNCERTAIN))
+    out.update(dict.fromkeys(GIT_TARGET + CONFIG_HOME + (ALLEXPORT,), UNCERTAIN))
     return None, out
 
 
@@ -1723,8 +1795,13 @@ def judge_git(args, cwd, env, scoped=None, depth=0, opaque_cmd=False,
         elif val is not None:             # an unset VAR makes git fail outright
             resolved.append((key, var, val))  # its value never reaches a probe argv
     configs = resolved
-    if rest[:2] == ["worktree", "add"]:
-        WORKTREE_ADDED.append(True)
+    if rest[0] == "worktree":
+        try:
+            action = first_word(rest[1:], env)
+        except Unresolved:
+            action = "add"                # it may be: a false deny costs nothing
+        if action == "add":
+            WORKTREE_ADDED.append(True)
     if rest[0] != "stash" and ALIAS_WRITTEN and rest[0] not in GIT_BUILTINS and \
             not rest[0].startswith("-") and not is_git_command(rest[0], git_env):
         return blocked(f"`git {rest[0]}`", "a `git config` earlier in this "
@@ -1753,11 +1830,15 @@ def judge_git(args, cwd, env, scoped=None, depth=0, opaque_cmd=False,
         return judge_alias(rest, target, git_dir, work_tree, configs,
                            config_unresolved, seen, git_env, depth,
                            str(where) if where else None)
-    sub = rest[1] if len(rest) > 1 else "push"
+    doubt = None                          # `git $X` / `$G stash`: the word may hold
+    if opaque_cmd or (opaque and args[i][:1] in ("$", "`")) or \
+            (opaque and args[i].startswith(XARGS)):  # `-C <dir>` / `--git-dir`
+        doubt = (f"{opaque or 'the command word is unresolved'}, and it may "
+                 f"expand to git options naming another repo than this one")
     try:
-        sub = (expand_word(sub, env) or ["push"])[0]
+        sub = first_word(rest[1:], env) or "push"
     except Unresolved as e:
-        opaque = opaque or str(e)
+        sub, opaque = "push", opaque or str(e)
     if sub in READ_ONLY and not opaque:
         return None
     label = f"`git stash{'' if len(rest) < 2 else ' ' + rest[1]}`"
@@ -1775,8 +1856,8 @@ def judge_git(args, cwd, env, scoped=None, depth=0, opaque_cmd=False,
     if git_dir is None and "GIT_DIR" in git_env:
         git_dir = git_env.pop("GIT_DIR")
     reason = shared_reason(target, git_dir, work_tree, git_env)
-    if not reason:
-        return None
+    if not reason:                        # this repo's stack is not shared, but
+        return blocked(label, doubt) if doubt else None  # it may not be the target
     if opaque:                            # a stash only if the word expands to one
         reason += (f", and a word of it could not be resolved ({opaque}), "
                    f"so it may be a mutating stash")
