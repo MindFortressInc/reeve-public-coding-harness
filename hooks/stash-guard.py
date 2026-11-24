@@ -147,7 +147,7 @@ WRAPPERS = {"time": ("", (), 0), "nohup": ("", (), 0),
                                    "--max-args", "--max-procs", "--max-chars",
                                    "--process-slot-var"), 0)}
 GIT_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace",
-                       "--super-prefix", "--config-env"}
+                       "--super-prefix", "--config-env", "--attr-source"}
 # Long-standing git builtins: git ignores an alias that shadows one, so these
 # never need an alias lookup.
 GIT_BUILTINS = set("""add am annotate apply archive bisect blame branch bundle
@@ -194,6 +194,7 @@ ALIAS_WRITE = "\0a"                      # env key: a `git config` here may writ
 ALIAS_WRITTEN = []                        # every such write: it lands on disk, so it
                                           # outlives the subshell or child that made it
 CASE_WORD = re.compile(r"(case|esac)(?![^\s;&|()<>])")
+BLOCK_LEAD = re.compile(r"[ \t]*(?:(?:then|do|else|elif|if|while|until|[{!])[ \t]+)+")
 CMD_POS = re.compile(r"(?:^|[;&|(\n])[ \t]*(?:(?:then|do|else|elif|if|while|until|[{!])[ \t]+)*$")
 ENV_S_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 CASE_HEAD = re.compile(r"\s*(?:(?:[{!]|then|do|else|elif|if|while|until)\s+)*case\s+"
@@ -221,13 +222,18 @@ WORKTREE_ADDED = []
 # Where each earlier `git worktree move` may put its worktree (None: unknown).
 # A path that is not a repo at probe time may be that worktree by the stash.
 WORKTREE_MOVED = []
+# Every earlier command other than git or a shell builtin that sets state
+# (`ln -s /shared x`, `mkdir`, a script): any may create a path a later
+# `git -C` names, so a target missing at probe time may exist by the stash.
+PATH_WRITERS = []
 
 
 def side_effects():
     """Counts of the request-wide writes a loop pass can make that its shell
     state does not show: worktree adds / moves and alias writes, which land
     on disk even from a subshell, so the next pass sees them."""
-    return len(WORKTREE_ADDED), len(WORKTREE_MOVED), len(ALIAS_WRITTEN)
+    return (len(WORKTREE_ADDED), len(WORKTREE_MOVED), len(ALIAS_WRITTEN),
+            bool(PATH_WRITERS))
 
 ALTERNATIVES = (
     "refs/stash is ONE stack shared by every worktree of this repo, so a pop "
@@ -568,6 +574,16 @@ def segments_at(s):
         segs.extend((seg, marker))
         buf, docs = [], []
 
+    def enter_block():                    # `else x "$(cmd)"`: the branch is entered
+        nonlocal buf, esc                 # before $(cmd) runs, so its block words
+        if cases and cases[-1] == "pattern":  # go out first, as `then (cd x)` does
+            return
+        m = BLOCK_LEAD.match("".join(buf))
+        if m and "".join(buf[:m.end()]) == m.group(0):
+            segs.append(Seg(m.group(0)))
+            buf = buf[m.end():]
+            esc = esc - m.end() if esc >= m.end() else -1
+
     def read_docs(i):                     # heredoc bodies follow this line
         nonlocal pending
         for strip_tabs, delim, quoted, owner in pending:
@@ -580,6 +596,7 @@ def segments_at(s):
         c = s[i]
         if q:
             if q == '"' and (c == "`" or s.startswith("$(", i)):
+                enter_block()
                 bodies, i = substitution(s, i)
                 segs += [x for b in bodies for x in (OPEN, *segments(b), CLOSE)]
                 buf.append(SUBST)
@@ -624,6 +641,7 @@ def segments_at(s):
                 i = m.end()
                 continue
         if c == "`" or s.startswith("$(", i):
+            enter_block()
             bodies, i = substitution(s, i)  # bodies run first; outer sees a token
             segs += [x for b in bodies for x in (OPEN, *segments(b), CLOSE)]
             buf.append(SUBST)
@@ -772,6 +790,11 @@ def path_word(word, env):
         raise Unresolved(f"{word!r} holds a quoted `$` that quote removal hides")
     tilde_prefix(word)
     path = expand(word, env)
+    ifs = env.get("IFS", " \t\n")       # quote removal also hides whether a $VAR
+    for m in VAR.finditer(word):          # was quoted: unquoted, one holding IFS
+        val = env[m.group(1) or m.group(2)]  # chars splits (`-C $d`, d='/x ')
+        if ifs == UNCERTAIN or any(c in ifs for c in val) or not path:
+            raise Unresolved(f"{word!r} may split into other arguments or vanish")
     if GLOB.search(path):
         raise Unresolved(f"{word!r} may expand to another path (glob or brace)")
     return path
@@ -838,6 +861,9 @@ def shared_reason(target, git_dir, work_tree, git_env):
         if WORKTREE_ADDED:                # `git worktree add X && git -C X stash`
             return (f"a `git worktree add` earlier in this command may create "
                     f"{target} as a worktree before the stash runs")
+        if PATH_WRITERS and "cannot change to" in r.stderr:  # `ln -s /shared X && git -C X stash`
+            return (f"`{PATH_WRITERS[0]}` earlier in this command may create "
+                    f"{target} before the stash runs")
         return None                       # not a repo: the stash fails on its own
     lines = r.stdout.splitlines() if r is not None and not r.returncode else []
     if len(lines) < 2:
@@ -1230,6 +1256,7 @@ def scan(cmd, cwd, env, depth, rets=None):
                                           # failed) / (OR, state if it succeeded)
     func, fdepth, skip = None, 0, 0       # state at a `f() {` definition, its { } depth
     fname, fbody = None, []               # the function being defined, its segments
+    fwrote = 0                            # len(ALIAS_WRITTEN) where it started
     rets = [] if rets is None else rets
     segs = (list(cmd) if isinstance(cmd, list) else segments(cmd)) + [SEP]
     for idx, seg in enumerate(segs):
@@ -1248,6 +1275,7 @@ def scan(cmd, cwd, env, depth, rets=None):
             if func is None and type(body) is Seg and body.split()[:1] == ["{"]:
                 func = (cwd, dict(env), lst, elem, cond, piped, blocks)
                 blocks, fname, fbody = [], seg.split()[-1], []
+                fwrote = len(ALIAS_WRITTEN)
             elif func is None and body == OPEN:   # `f() ( ... )`: a subshell body,
                 at = k = segs.index(OPEN, idx + 4)  # scanned here as one too
                 nest = 0
@@ -1316,6 +1344,7 @@ def scan(cmd, cwd, env, depth, rets=None):
         if func is None and toks[:1] == ["function"] and toks[2:3] == ["{"]:
             func = (cwd, dict(env), lst, elem, cond, piped, blocks)
             fname, blocks, toks = toks[1], [], toks[2:]  # `function f {`: the body follows
+            fwrote = len(ALIAS_WRITTEN)
             fbody = [Seg(re.sub(r"^\s*function\s+\S+", "", seg))]
             fbody[0].docs = seg.docs
         while toks and toks[0] in BLOCK_WORDS:
@@ -1327,6 +1356,7 @@ def scan(cmd, cwd, env, depth, rets=None):
                     env[FUNC + fname] = ((tuple(fbody), " ".join(   # `} > f`: each call
                         [*fbody, *(d for b in fbody for d, _ in getattr(b, "docs", ()))]),
                         may_fail(redirs)),)  # applies it, and a failed one skips the body
+                    del ALIAS_WRITTEN[fwrote:]  # its writes happen where f is called
                     func = None
                 continue
             if w in OPENERS:              # a branch or loop body may be skipped
@@ -1483,7 +1513,23 @@ def scan(cmd, cwd, env, depth, rets=None):
         if head in ("export", "unset"):
             old_env = dict(env)
             opts = "".join(t[1:] for t in toks[1:] if t.startswith("-"))
-            for t in toks[1:]:
+            operands = toks[1:]
+            if head == "unset":           # bash expands every operand first:
+                operands = []             # `unset "$key"` unsets what $key holds
+                for t in toks[1:]:
+                    if t.startswith("-") or not ("$" in t or "`" in t or XARGS in t) \
+                            or getattr(t, "full", False):
+                        operands.append(t)
+                        continue
+                    try:
+                        if isinstance(t, Lit):
+                            raise Unresolved(f"{t!r} holds a quoted `$`")
+                        operands += expand_word(t, old_env)
+                    except Unresolved:    # it may unset any var
+                        if "f" not in opts:
+                            env.update((k, UNCERTAIN) for k in old_env
+                                       if not k.startswith("\0"))
+            for t in operands:
                 k, eq, v = t.partition("=")
                 if t.startswith("-") or not ASSIGN.match(k + "="):
                     continue
@@ -1558,6 +1604,9 @@ def scan(cmd, cwd, env, depth, rets=None):
                 run_cwd = resolve(d, run_cwd, env, physical=True)
         except Unresolved:
             run_cwd = None
+        name = os.path.basename(head)
+        if opaque or name != "git":       # it may create a path a later -C names
+            PATH_WRITERS.append(head)
         if opaque:                        # judge it as if the word expands to git
             wrote = len(ALIAS_WRITTEN)
             if judge_git(toks[1:], run_cwd, env, scoped, depth, opaque_cmd=True):
@@ -1568,7 +1617,6 @@ def scan(cmd, cwd, env, depth, rets=None):
             if len(ALIAS_WRITTEN) > wrote:
                 env[ALIAS_WRITE] = "1"    # a loop's next pass must see it
             continue
-        name = os.path.basename(head)
         if name in SHELLS or name == "eval":
             if name == "eval":
                 raw, pos = " ".join(toks[1:]), []

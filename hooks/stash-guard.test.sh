@@ -570,6 +570,20 @@ check "single-quoted -c body expands itself" "ACTION=pop; bash -c 'ACTION=list; 
 check "double-quoted -c body: caller expands" "ACTION=pop; bash -c \"ACTION=list; git stash \$ACTION\"" "$WT" DENY "linked worktree"
 check "definition redirection may skip it"  "f() { cd $SOLO; } > /nonexistent/out; f; git stash pop" "$WT" DENY "could not resolve"
 check "definition to /dev/null carries cd"  "f() { cd $SOLO; } > /dev/null; f; git stash pop" "$WT" ALLOW
+check "\$(...) in else runs in that branch" "if false; then cd $SOLO; else printf '%s\\n' \"\$(git stash pop)\"; fi" "$WT" DENY "linked worktree"
+check "unquoted \$(...) in else, same branch" "if false; then cd $SOLO; else echo \$(git stash pop); fi" "$WT" DENY "linked worktree"
+check "\$(...) after a cd in its own arm"    "if test -n \"\$X\"; then cd $SOLO; echo \"\$(git stash pop)\"; fi" "$WT" ALLOW
+check "unset of a computed name"            "export GIT_DIR=$SOLO/.git; key=GIT_DIR; unset \"\$key\"; git stash pop" "$WT" DENY "linked worktree"
+check "unset of an unresolvable name"       "export GIT_DIR=$SOLO/.git; unset \"\$NOPE_UNSET_VAR\"; git stash pop" "$WT" DENY
+check "unset of a computed name, solo"      "export GIT_DIR=$WT/.git; key=GIT_DIR; unset \"\$key\"; git stash pop" "$SOLO" ALLOW
+check "literal unset still applies"         "export GIT_DIR=$SOLO/.git; unset GIT_DIR; git stash pop" "$WT" DENY "linked worktree"
+check "ln -s creates the -C target"         "ln -s $WT $T/lnwt && git -C $T/lnwt stash pop" "$PLAIN" DENY "may create"
+check "a missing -C target on its own"      "git -C $T/nope2 stash pop"       "$PLAIN" ALLOW
+check "--attr-source takes a separate value" "git --attr-source HEAD stash pop" "$WT" DENY "linked worktree"
+check "unquoted -C \$d may split"            "d='$WT '; git -C \$d stash pop"  "$PLAIN" DENY "may split"
+check "-C \$d with no IFS char"              "d=$SOLO; git -C \$d stash pop"   "$WT" ALLOW
+check "a definition's alias write stays local" "f() { git config alias.zz status; }; git -c alias.stq=status stq" "$WT" ALLOW
+check "a called definition's alias write"   "f() { git config alias.zz status; }; f; git -c alias.stq=status stq" "$WT" DENY
 
 # --- the main checkout is guarded too while other worktrees exist
 check "main tree with a linked wt attached" "git stash"                       "$MAIN" DENY "other worktree"
