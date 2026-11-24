@@ -585,6 +585,28 @@ check "-C \$d with no IFS char"              "d=$SOLO; git -C \$d stash pop"   "
 check "a definition's alias write stays local" "f() { git config alias.zz status; }; git -c alias.stq=status stq" "$WT" ALLOW
 check "a called definition's alias write"   "f() { git config alias.zz status; }; f; git -c alias.stq=status stq" "$WT" DENY
 
+# --- CodeRabbit round 13
+check "X=/opt/env is an assignment, not env" "X=/opt/env cd $WT; git stash pop" "$SOLO" DENY "linked worktree"
+check "X=/x/nice is an assignment, not nice" "X=/x/nice cd $WT; git stash pop" "$SOLO" DENY "linked worktree"
+mkdir -p "$T/gd"; ln -s "$WT/.git" "$T/gd/time"
+check "GIT_DIR=.../time is an assignment"   "GIT_DIR=$T/gd/time git stash pop" "$SOLO" DENY "linked worktree"
+check "gtimeout wrapper"                    "gtimeout 60 git stash pop"       "$WT" DENY "linked worktree"
+check "gtimeout of a read-only stash"       "gtimeout 5 git stash list"       "$WT" ALLOW
+check "flock FILE CMD"                      "flock $T/l git stash pop"        "$WT" DENY "linked worktree"
+check "flock options take values"           "flock -n -w 5 -E 3 $T/l git stash clear" "$WT" DENY "linked worktree"
+check "flock FILE -c STRING"                "flock $T/l -c 'git stash pop'"   "$WT" DENY "linked worktree"
+check "flock of a read-only stash"          "flock $T/l git stash list"       "$WT" ALLOW
+check "flock on an fd runs nothing"         "flock 9"                         "$WT" ALLOW
+check "find -exec git stash"                "find . -exec git stash pop \;"  "$WT" DENY "linked worktree"
+check "find, a later -exec"                 "find . -exec true \; -exec git stash pop \;" "$WT" DENY "linked worktree"
+check "find -execdir: dir is unresolved"    "find . -execdir git stash pop {} +" "$SOLO" DENY "could not resolve"
+check "find {} as -C is unresolved"         "find . -exec git -C {} stash clear \;" "$SOLO" DENY "could not resolve"
+check "find -exec env -C"                   "find . -exec env -C $WT git stash pop \;" "$SOLO" DENY "linked worktree"
+check "find -ok sh -c is denied"            "find . -ok sh -c 'git stash pop' \;" "$SOLO" DENY "not judged"
+check "find -exec of a read-only stash"     "find . -exec git stash list \;" "$WT" ALLOW
+check "find -exec grep of the text"         "find . -exec grep -l 'git stash pop' {} +" "$WT" ALLOW
+check "find -exec git stash, solo repo"     "find . -exec git stash pop \;"  "$SOLO" ALLOW
+
 # --- the main checkout is guarded too while other worktrees exist
 check "main tree with a linked wt attached" "git stash"                       "$MAIN" DENY "other worktree"
 check "-C main from elsewhere"              "git -C $MAIN stash pop"          "$PLAIN" DENY

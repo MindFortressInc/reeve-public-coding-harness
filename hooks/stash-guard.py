@@ -62,9 +62,14 @@ naming another repo, so it is denied even where this repo's stack is solo.
 An arithmetic `$(( ))` is not a command: only the substitutions inside it
 (and its text, if it may spell a stash) are scanned.
 `env` / shells / `eval` / wrappers (`time -p`, `command -p`, `sudo -u X`,
-`exec -a X`, `timeout`, `nice`, `stdbuf`, `ionice`, `setsid`, `xargs`) match
-by basename like git, their options consumed (the arguments xargs appends, or
-its `-I` strings, are unresolvable); `command -v` / `-V` runs nothing;
+`exec -a X`, `timeout`, `gtimeout`, `nice`, `stdbuf`, `ionice`, `setsid`,
+`xargs`, `flock FILE` and its `-c` string) match by basename like git, their
+options consumed (the arguments xargs appends, or its `-I` strings, are
+unresolvable; a VAR=val prefix is an assignment even when its value ends in
+`/env` or a wrapper name); `find`'s `-exec` / `-execdir` / `-ok` / `-okdir`
+commands are judged (`{}` and an `-execdir` directory are unresolvable; a
+shell or unresolvable command word there that may run git is denied);
+`command -v` / `-V` runs nothing;
 `command` / `builtin` skip shell functions, and the program launchers skip
 functions and run `cd` / `export` / `eval` in a child, not this shell. A
 function call fills the body's `$1` / `"$@"` with its arguments; a `{ }` or
@@ -139,6 +144,7 @@ WRAPPERS = {"time": ("", (), 0), "nohup": ("", (), 0),
             "setsid": ("", (), 0), "exec": ("a", (), 0),
             "sudo": ("ugpCDrtUTR", SUDO_LONG_WITH_VALUE, 0),
             "timeout": ("sk", ("--signal", "--kill-after"), 1),
+            "gtimeout": ("sk", ("--signal", "--kill-after"), 1),
             "nice": ("n", ("--adjustment",), 0),
             "stdbuf": ("ioe", ("--input", "--output", "--error"), 0),
             "ionice": ("cnpt", ("--class", "--classdata", "--pid", "--pgid",
@@ -994,6 +1000,24 @@ def strip_prefix(toks, env):
         t = toks[0]
         if t in PREFIX_WORDS:
             toks = toks[1:]
+        elif ASSIGN.match(t):             # before the basename checks: `X=/opt/env`
+            k, v = t.split("=", 1)        # is an assignment, not env
+            scoped[k] = v
+            toks = toks[1:]
+        elif os.path.basename(t) == "flock":  # flock [opts] FILE CMD... / -c STRING
+            toks, lookup = toks[1:], EXTERNAL
+            while toks and toks[0].startswith("-") and toks[0] not in ("-c", "--command"):
+                o, toks = toks[0], toks[1:]
+                if o == "--":
+                    break
+                if o in ("--wait", "--timeout", "--conflict-exit-code") or (
+                        not o.startswith("--") and o[-1] in "wE"
+                        and not set(o[1:-1]) & set("wE")):
+                    toks = toks[1:]       # its value (`-w 5`, `-nw 5`; `-w5` holds it)
+            if toks[:1] not in (["-c"], ["--command"]):
+                toks = toks[1:]           # the lock file (or a lone fd: runs nothing)
+            if toks[:1] in (["-c"], ["--command"]):
+                toks = ["sh", "-c", *toks[1:2]]   # flock runs its string with $SHELL -c
         elif os.path.basename(t) in WRAPPERS:
             wrapper, toks = os.path.basename(t), toks[1:]
             takes, long_takes, positional = WRAPPERS[wrapper]
@@ -1066,10 +1090,6 @@ def strip_prefix(toks, env):
                         else:
                             env_opt(o[k], val)
                         break
-        elif ASSIGN.match(t):
-            k, v = t.split("=", 1)
-            scoped[k] = v
-            toks = toks[1:]
         else:
             break
     return toks, scoped, chdirs, lookup
@@ -1669,6 +1689,16 @@ def scan(cmd, cwd, env, depth, rets=None):
                 if reason:
                     return reason, cwd, env
             continue
+        if name == "find":                # its -exec / -ok actions run commands
+            wrote = len(ALIAS_WRITTEN)
+            for action, in_dir in find_actions(toks[1:]):
+                reason = judge_action(action, None if in_dir else run_cwd, env,
+                                      scoped, depth)
+                if reason:
+                    return reason, cwd, env
+            if len(ALIAS_WRITTEN) > wrote:
+                env[ALIAS_WRITE] = "1"    # a loop's next pass must see it
+            continue
         if name != "git":
             continue
         wrote = len(ALIAS_WRITTEN)
@@ -1683,6 +1713,52 @@ def scan(cmd, cwd, env, depth, rets=None):
         for j in b[5]:                    # its pass may end at a `continue`
             cwd, env = merge(cwd, env, *j)
     return None, cwd, env
+
+
+def find_actions(args):
+    """The commands `find`'s -exec / -execdir / -ok / -okdir actions run, as
+    (words, whether it runs in the found file's own directory). Each `{}`
+    becomes XARGS: find fills it in with a path."""
+    out, i = [], 0
+    while i < len(args):
+        a, i = args[i], i + 1
+        if a not in ("-exec", "-execdir", "-ok", "-okdir"):
+            continue
+        cmd = []
+        while i < len(args) and args[i] != ";" and not (args[i] == "+" and
+                                                         cmd[-1:] == ["{}"]):
+            cmd.append(args[i])
+            i += 1
+        i += 1
+        out.append(([w.replace("{}", XARGS) for w in cmd], a.endswith("dir")))
+    return out
+
+
+def judge_action(words, cwd, env, scoped, depth):
+    """Deny reason for a command a `find` action runs from `cwd` (None: the
+    found file's directory), or None. find execs a program, so wrappers and
+    VAR=val prefixes apply but no function or builtin of this shell does; a
+    git one is judged, and a shell or unresolvable command word that may run
+    git is denied, not modelled."""
+    text = " ".join(words)
+    try:
+        toks, more, chdirs, _ = strip_prefix(words, env)
+        for d in chdirs:
+            cwd = None if cwd is None else resolve(d, cwd, env, physical=True)
+    except Unresolved as e:
+        return blocked("a command `find` runs", e) if may_stash(text) else None
+    if not toks:
+        return None
+    head = toks[0]
+    if "$" in head or "`" in head or XARGS in head \
+            or os.path.basename(head) in SHELLS | {"find"}:
+        if may_git(text) or may_stash(text):
+            return blocked("a command `find` runs that may run `git stash`",
+                           f"{os.path.basename(head)!r} is not judged under find")
+        return None
+    if os.path.basename(head) != "git":
+        return None
+    return judge_git(toks[1:], cwd, env, {**scoped, **more}, depth)
 
 
 def bind_loop_var(toks, env, known):
