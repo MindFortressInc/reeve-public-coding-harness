@@ -348,6 +348,11 @@ check "for over a solo repo"                "for W in $SOLO; do git -C \"\$W\" s
 check "glob -C target is unresolved"        "git -C main.w* stash pop"        "$T" DENY "could not resolve"
 check "brace -C target is unresolved"       "git -C {main.wt,} stash pop"     "$T" DENY "could not resolve"
 check "glob -C, read-only stash"            "git -C main.w* stash list"       "$T" ALLOW
+check "~- -C target is unresolved"          "git -C ~- stash pop"             "$SOLO" DENY "could not resolve"
+check "~+ -C target is unresolved"          "git -C ~+ stash pop"             "$SOLO" DENY "could not resolve"
+check "~name -C target is unresolved"       "git -C ~nosuchuser/x stash pop"  "$SOLO" DENY "could not resolve"
+check "~- --git-dir is unresolved"          "git --git-dir=~-/.git stash pop" "$SOLO" DENY "could not resolve"
+check "~- -C, read-only stash"              "git -C ~- stash list"            "$SOLO" ALLOW
 check "worktree add before a solo stash"    "git -C $SOLO worktree add --detach $T/new HEAD && git -C $SOLO stash" "$PLAIN" DENY "may attach another worktree"
 check "worktree add after the stash"        "git -C $SOLO stash; git -C $SOLO worktree add --detach $T/new HEAD" "$PLAIN" ALLOW
 check "here string to a script is data"     "bash read-line.sh <<< 'git stash pop'" "$WT" ALLOW

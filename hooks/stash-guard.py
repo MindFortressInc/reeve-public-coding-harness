@@ -755,12 +755,22 @@ def first_word(ws, env):
     return None
 
 
+def tilde_prefix(word):
+    """Raise Unresolved for a `~name`, `~+` or `~-` prefix: the shell turns
+    it into a user's home, $PWD or $OLDPWD, which `expand` does not track,
+    so probing it as a literal relative path would test the wrong place."""
+    head = word.split("/", 1)[0]
+    if head.startswith("~") and head != "~":
+        raise Unresolved(f"{word!r} has a tilde prefix that is not tracked")
+
+
 def path_word(word, env):
     """A path word once expanded. Quote removal hides whether a glob or brace
     in it expands (`git -C main.w*` reaches git as `main.wt`), so one that may
     is Unresolved rather than probed literally."""
     if isinstance(word, Lit):
         raise Unresolved(f"{word!r} holds a quoted `$` that quote removal hides")
+    tilde_prefix(word)
     path = expand(word, env)
     if GLOB.search(path):
         raise Unresolved(f"{word!r} may expand to another path (glob or brace)")
@@ -786,6 +796,7 @@ def cd_target(arg, cwd, env, physical, cdpath):
     included) first (an empty entry is the cwd), as bash does, then taken
     relative to the cwd. `env` expands the word, as the shell does before
     a prefix assignment applies."""
+    tilde_prefix(arg)
     path = expand(arg, env)
     if os.path.isabs(path) or not cdpath or \
             path.split("/", 1)[0] in (".", ".."):
